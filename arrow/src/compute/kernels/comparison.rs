@@ -378,7 +378,7 @@ pub fn ilike_utf8<OffsetSize: OffsetSizeTrait>(
     right: &GenericStringArray<OffsetSize>,
 ) -> Result<BooleanArray> {
     regex_like(left, right, false, |re_pattern| {
-        RegexBuilder::new(&format!("(?i)^{}$", re_pattern))
+        RegexBuilder::new(&format!("^{}$", re_pattern))
             .case_insensitive(true)
             .build()
             .map_err(|e| {
