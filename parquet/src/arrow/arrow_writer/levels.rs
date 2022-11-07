@@ -213,7 +213,7 @@ impl LevelInfoBuilder {
 
     /// Write `range` elements from ListArray `array`
     ///
-    /// Note: MapArrays are ListArray<i32> under the hood and so are dispatched to this method
+    /// Note: MapArrays are `ListArray<i32>` under the hood and so are dispatched to this method
     fn write_list<O: OffsetSizeTrait>(
         &mut self,
         offsets: &[O],
@@ -276,8 +276,8 @@ impl LevelInfoBuilder {
                 // TODO: Faster bitmask iteration (#1757)
                 for (idx, w) in offsets.windows(2).enumerate() {
                     let is_valid = nulls.is_set(idx + null_offset);
-                    let start_idx = w[0].to_usize().unwrap();
-                    let end_idx = w[1].to_usize().unwrap();
+                    let start_idx = w[0].as_usize();
+                    let end_idx = w[1].as_usize();
                     if !is_valid {
                         write_null_slice(child)
                     } else if start_idx == end_idx {
@@ -289,8 +289,8 @@ impl LevelInfoBuilder {
             }
             None => {
                 for w in offsets.windows(2) {
-                    let start_idx = w[0].to_usize().unwrap();
-                    let end_idx = w[1].to_usize().unwrap();
+                    let start_idx = w[0].as_usize();
+                    let end_idx = w[1].as_usize();
                     if start_idx == end_idx {
                         write_empty_slice(child)
                     } else {
@@ -1188,7 +1188,7 @@ mod tests {
             Field::new("item", DataType::Struct(vec![int_field.clone()]), true);
         let list_field = Field::new("list", DataType::List(Box::new(item_field)), true);
 
-        let int_builder = Int32Builder::new(10);
+        let int_builder = Int32Builder::with_capacity(10);
         let struct_builder =
             StructBuilder::new(vec![int_field], vec![Box::new(int_builder)]);
         let mut list_builder = ListBuilder::new(struct_builder);

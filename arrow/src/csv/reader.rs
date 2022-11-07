@@ -55,9 +55,10 @@ use crate::array::{
 };
 use crate::datatypes::*;
 use crate::error::{ArrowError, Result};
-use crate::record_batch::RecordBatch;
+use crate::record_batch::{RecordBatch, RecordBatchOptions};
 use crate::util::reader_parser::Parser;
 
+use crate::csv::map_csv_error;
 use csv_crate::{ByteRecord, StringRecord};
 use std::ops::Neg;
 
@@ -120,6 +121,8 @@ pub struct ReaderOptions {
 ///
 /// Return inferred schema and number of records used for inference. This function does not change
 /// reader cursor offset.
+///
+/// The inferred schema will always have each field set as nullable.
 pub fn infer_file_schema<R: Read + Seek>(
     reader: R,
     delimiter: u8,
@@ -187,10 +190,10 @@ fn infer_reader_schema_with_csv_options<R: Read>(
     // get or create header names
     // when has_header is false, creates default column names with column_ prefix
     let headers: Vec<String> = if roptions.has_header {
-        let headers = &csv_reader.headers()?.clone();
+        let headers = &csv_reader.headers().map_err(map_csv_error)?.clone();
         headers.iter().map(|s| s.to_string()).collect()
     } else {
-        let first_record_count = &csv_reader.headers()?.len();
+        let first_record_count = &csv_reader.headers().map_err(map_csv_error)?.len();
         (0..*first_record_count)
             .map(|i| format!("column_{}", i + 1))
             .collect()
@@ -199,8 +202,6 @@ fn infer_reader_schema_with_csv_options<R: Read>(
     let header_length = headers.len();
     // keep track of inferred field types
     let mut column_types: Vec<HashSet<DataType>> = vec![HashSet::new(); header_length];
-    // keep track of columns with nulls
-    let mut nulls: Vec<bool> = vec![false; header_length];
 
     let mut records_count = 0;
     let mut fields = vec![];
@@ -208,17 +209,17 @@ fn infer_reader_schema_with_csv_options<R: Read>(
     let mut record = StringRecord::new();
     let max_records = roptions.max_read_records.unwrap_or(usize::MAX);
     while records_count < max_records {
-        if !csv_reader.read_record(&mut record)? {
+        if !csv_reader.read_record(&mut record).map_err(map_csv_error)? {
             break;
         }
         records_count += 1;
 
-        for i in 0..header_length {
+        // Note since we may be looking at a sample of the data, we make the safe assumption that
+        // they could be nullable
+        for (i, column_type) in column_types.iter_mut().enumerate().take(header_length) {
             if let Some(string) = record.get(i) {
-                if string.is_empty() {
-                    nulls[i] = true;
-                } else {
-                    column_types[i]
+                if !string.is_empty() {
+                    column_type
                         .insert(infer_field_schema(string, roptions.datetime_re.clone()));
                 }
             }
@@ -228,7 +229,6 @@ fn infer_reader_schema_with_csv_options<R: Read>(
     // build schema from inference results
     for i in 0..header_length {
         let possibilities = &column_types[i];
-        let has_nulls = nulls[i];
         let field_name = &headers[i];
 
         // determine data type based on possible types
@@ -236,7 +236,7 @@ fn infer_reader_schema_with_csv_options<R: Read>(
         match possibilities.len() {
             1 => {
                 for dtype in possibilities.iter() {
-                    fields.push(Field::new(field_name, dtype.clone(), has_nulls));
+                    fields.push(Field::new(field_name, dtype.clone(), true));
                 }
             }
             2 => {
@@ -244,13 +244,13 @@ fn infer_reader_schema_with_csv_options<R: Read>(
                     && possibilities.contains(&DataType::Float64)
                 {
                     // we have an integer and double, fall down to double
-                    fields.push(Field::new(field_name, DataType::Float64, has_nulls));
+                    fields.push(Field::new(field_name, DataType::Float64, true));
                 } else {
                     // default to Utf8 for conflicting datatypes (e.g bool and int)
-                    fields.push(Field::new(field_name, DataType::Utf8, has_nulls));
+                    fields.push(Field::new(field_name, DataType::Utf8, true));
                 }
             }
-            _ => fields.push(Field::new(field_name, DataType::Utf8, has_nulls)),
+            _ => fields.push(Field::new(field_name, DataType::Utf8, true)),
         }
     }
 
@@ -671,7 +671,15 @@ fn parse(
         Some(metadata) => Schema::new_with_metadata(projected_fields, metadata),
     });
 
-    arrays.and_then(|arr| RecordBatch::try_new(projected_schema, arr))
+    arrays.and_then(|arr| {
+        RecordBatch::try_new_with_options(
+            projected_schema,
+            arr,
+            &RecordBatchOptions::new()
+                .with_match_field_names(true)
+                .with_row_count(Some(rows.len())),
+        )
+    })
 }
 fn parse_item<T: Parser>(string: &str) -> Option<T::Native> {
     T::parse(string)
@@ -696,10 +704,10 @@ fn build_decimal_array(
     _line_number: usize,
     rows: &[StringRecord],
     col_idx: usize,
-    precision: usize,
-    scale: usize,
+    precision: u8,
+    scale: u8,
 ) -> Result<ArrayRef> {
-    let mut decimal_builder = Decimal128Builder::new(rows.len(), precision, scale);
+    let mut decimal_builder = Decimal128Builder::with_capacity(rows.len());
     for row in rows {
         let col_s = row.get(col_idx);
         match col_s {
@@ -716,7 +724,7 @@ fn build_decimal_array(
                         parse_decimal_with_parameter(s, precision, scale);
                     match decimal_value {
                         Ok(v) => {
-                            decimal_builder.append_value(v)?;
+                            decimal_builder.append_value(v);
                         }
                         Err(e) => {
                             return Err(e);
@@ -726,16 +734,21 @@ fn build_decimal_array(
             }
         }
     }
-    Ok(Arc::new(decimal_builder.finish()))
+    Ok(Arc::new(
+        decimal_builder
+            .finish()
+            .with_precision_and_scale(precision, scale)?,
+    ))
 }
 
 // Parse the string format decimal value to i128 format and checking the precision and scale.
 // The result i128 value can't be out of bounds.
-fn parse_decimal_with_parameter(s: &str, precision: usize, scale: usize) -> Result<i128> {
+fn parse_decimal_with_parameter(s: &str, precision: u8, scale: u8) -> Result<i128> {
     if PARSE_DECIMAL_RE.is_match(s) {
         let mut offset = s.len();
         let len = s.len();
         let mut base = 1;
+        let scale_usize = usize::from(scale);
 
         // handle the value after the '.' and meet the scale
         let delimiter_position = s.find('.');
@@ -746,12 +759,12 @@ fn parse_decimal_with_parameter(s: &str, precision: usize, scale: usize) -> Resu
             }
             Some(mid) => {
                 // there is the '.'
-                if len - mid >= scale + 1 {
+                if len - mid >= scale_usize + 1 {
                     // If the string value is "123.12345" and the scale is 2, we should just remain '.12' and drop the '345' value.
-                    offset -= len - mid - 1 - scale;
+                    offset -= len - mid - 1 - scale_usize;
                 } else {
                     // If the string value is "123.12" and the scale is 4, we should append '00' to the tail.
-                    base = 10_i128.pow((scale + 1 + mid - len) as u32);
+                    base = 10_i128.pow((scale_usize + 1 + mid - len) as u32);
                 }
             }
         };
@@ -776,8 +789,14 @@ fn parse_decimal_with_parameter(s: &str, precision: usize, scale: usize) -> Resu
         if negative {
             result = result.neg();
         }
-        validate_decimal_precision(result, precision)
-            .map_err(|e| ArrowError::ParseError(format!("parse decimal overflow: {}", e)))
+
+        match validate_decimal_precision(result, precision) {
+            Ok(_) => Ok(result),
+            Err(e) => Err(ArrowError::ParseError(format!(
+                "parse decimal overflow: {}",
+                e
+            ))),
+        }
     } else {
         Err(ArrowError::ParseError(format!(
             "can't parse the string value {} to decimal",
@@ -1116,11 +1135,10 @@ mod tests {
     use std::io::{Cursor, Write};
     use tempfile::NamedTempFile;
 
-    use crate::array::BasicDecimalArray;
     use crate::array::*;
     use crate::compute::cast;
     use crate::datatypes::Field;
-    use chrono::{prelude::*, LocalResult};
+    use chrono::prelude::*;
 
     #[test]
     fn test_csv() {
@@ -1271,9 +1289,9 @@ mod tests {
 
         let mut csv = builder.build(file).unwrap();
         let expected_schema = Schema::new(vec![
-            Field::new("city", DataType::Utf8, false),
-            Field::new("lat", DataType::Float64, false),
-            Field::new("lng", DataType::Float64, false),
+            Field::new("city", DataType::Utf8, true),
+            Field::new("lat", DataType::Float64, true),
+            Field::new("lng", DataType::Float64, true),
         ]);
         assert_eq!(Arc::new(expected_schema), csv.schema());
         let batch = csv.next().unwrap().unwrap();
@@ -1498,10 +1516,10 @@ mod tests {
             ]
         );
 
-        assert!(!schema.field(0).is_nullable());
+        assert!(schema.field(0).is_nullable());
         assert!(schema.field(1).is_nullable());
         assert!(schema.field(2).is_nullable());
-        assert!(!schema.field(3).is_nullable());
+        assert!(schema.field(3).is_nullable());
         assert!(schema.field(4).is_nullable());
         assert!(schema.field(5).is_nullable());
 
@@ -1672,32 +1690,12 @@ mod tests {
             let actual = result.unwrap_err().to_string();
 
             assert!(
-                actual.contains(&expected),
+                actual.contains(expected),
                 "actual: '{}', expected: '{}'",
                 actual,
                 expected
             );
         }
-    }
-
-    /// Interprets a naive_datetime (with no explicit timezone offset)
-    /// using the local timezone and returns the timestamp in UTC (0
-    /// offset)
-    fn naive_datetime_to_timestamp(naive_datetime: &NaiveDateTime) -> i64 {
-        // Note: Use chrono APIs that are different than
-        // naive_datetime_to_timestamp to compute the utc offset to
-        // try and double check the logic
-        let utc_offset_secs = match Local.offset_from_local_datetime(naive_datetime) {
-            LocalResult::Single(local_offset) => {
-                local_offset.fix().local_minus_utc() as i64
-            }
-            _ => panic!(
-                "Unexpected failure converting {} to local datetime",
-                naive_datetime
-            ),
-        };
-        let utc_offset_nanos = utc_offset_secs * 1_000_000_000;
-        naive_datetime.timestamp_nanos() - utc_offset_nanos
     }
 
     #[test]
@@ -1712,11 +1710,11 @@ mod tests {
         );
         assert_eq!(
             parse_item::<TimestampMicrosecondType>("2018-11-13T17:11:10").unwrap(),
-            naive_datetime_to_timestamp(&naive_datetime) / 1000
+            naive_datetime.timestamp_nanos() / 1000
         );
         assert_eq!(
             parse_item::<TimestampMicrosecondType>("2018-11-13 17:11:10").unwrap(),
-            naive_datetime_to_timestamp(&naive_datetime) / 1000
+            naive_datetime.timestamp_nanos() / 1000
         );
         let naive_datetime = NaiveDateTime::new(
             NaiveDate::from_ymd(2018, 11, 13),
@@ -1724,7 +1722,7 @@ mod tests {
         );
         assert_eq!(
             parse_item::<TimestampMicrosecondType>("2018-11-13T17:11:10.011").unwrap(),
-            naive_datetime_to_timestamp(&naive_datetime) / 1000
+            naive_datetime.timestamp_nanos() / 1000
         );
         let naive_datetime = NaiveDateTime::new(
             NaiveDate::from_ymd(1900, 2, 28),
@@ -1732,7 +1730,7 @@ mod tests {
         );
         assert_eq!(
             parse_item::<TimestampMicrosecondType>("1900-02-28T12:34:56").unwrap(),
-            naive_datetime_to_timestamp(&naive_datetime) / 1000
+            naive_datetime.timestamp_nanos() / 1000
         );
     }
 
@@ -1748,11 +1746,11 @@ mod tests {
         );
         assert_eq!(
             parse_item::<TimestampNanosecondType>("2018-11-13T17:11:10").unwrap(),
-            naive_datetime_to_timestamp(&naive_datetime)
+            naive_datetime.timestamp_nanos()
         );
         assert_eq!(
             parse_item::<TimestampNanosecondType>("2018-11-13 17:11:10").unwrap(),
-            naive_datetime_to_timestamp(&naive_datetime)
+            naive_datetime.timestamp_nanos()
         );
         let naive_datetime = NaiveDateTime::new(
             NaiveDate::from_ymd(2018, 11, 13),
@@ -1760,7 +1758,7 @@ mod tests {
         );
         assert_eq!(
             parse_item::<TimestampNanosecondType>("2018-11-13T17:11:10.011").unwrap(),
-            naive_datetime_to_timestamp(&naive_datetime)
+            naive_datetime.timestamp_nanos()
         );
         let naive_datetime = NaiveDateTime::new(
             NaiveDate::from_ymd(1900, 2, 28),
@@ -1768,7 +1766,7 @@ mod tests {
         );
         assert_eq!(
             parse_item::<TimestampNanosecondType>("1900-02-28T12:34:56").unwrap(),
-            naive_datetime_to_timestamp(&naive_datetime)
+            naive_datetime.timestamp_nanos()
         );
     }
 
@@ -1802,10 +1800,10 @@ mod tests {
         )?;
 
         assert_eq!(schema.fields().len(), 4);
-        assert!(!schema.field(0).is_nullable());
+        assert!(schema.field(0).is_nullable());
         assert!(schema.field(1).is_nullable());
-        assert!(!schema.field(2).is_nullable());
-        assert!(!schema.field(3).is_nullable());
+        assert!(schema.field(2).is_nullable());
+        assert!(schema.field(3).is_nullable());
 
         assert_eq!(&DataType::Int64, schema.field(0).data_type());
         assert_eq!(&DataType::Utf8, schema.field(1).data_type());
@@ -1858,6 +1856,38 @@ mod tests {
         let a = batch.column(0);
         let a = a.as_any().downcast_ref::<UInt32Array>().unwrap();
         assert_eq!(a, &UInt32Array::from(vec![4, 5]));
+
+        assert!(csv.next().is_none());
+    }
+
+    #[test]
+    fn test_empty_projection() {
+        let schema = Schema::new(vec![Field::new("int", DataType::UInt32, false)]);
+        let data = vec![vec!["0"], vec!["1"]];
+
+        let data = data
+            .iter()
+            .map(|x| x.join(","))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let data = data.as_bytes();
+
+        let reader = std::io::Cursor::new(data);
+
+        let mut csv = Reader::new(
+            reader,
+            Arc::new(schema),
+            false,
+            None,
+            2,
+            None,
+            Some(vec![]),
+            None,
+        );
+
+        let batch = csv.next().unwrap().unwrap();
+        assert_eq!(batch.columns().len(), 0);
+        assert_eq!(batch.num_rows(), 2);
 
         assert!(csv.next().is_none());
     }

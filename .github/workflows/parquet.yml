@@ -28,6 +28,13 @@ on:
   pull_request:
     paths:
       - arrow/**
+      - arrow-array/**
+      - arrow-buffer/**
+      - arrow-cast/**
+      - arrow-data/**
+      - arrow-schema/**
+      - arrow-select/**
+      - arrow-ipc/**
       - parquet/**
       - .github/**
 
@@ -38,44 +45,30 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: amd64/rust
-      env:
-        # Disable full debug symbol generation to speed up CI build and keep memory down
-        # "1" means line tables only, which is useful for panic tracebacks.
-        RUSTFLAGS: "-C debuginfo=1"
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           submodules: true
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
-        with:
-          rust-version: stable
       - name: Test
-        run: |
-          cargo test -p parquet
+        run: cargo test -p parquet
       - name: Test --all-features
-        run: |
-          cargo test -p parquet --all-features
+        run: cargo test -p parquet --all-features
 
 
-  # test compilaton
+  # test compilation
   linux-features:
     name: Check Compilation
     runs-on: ubuntu-latest
     container:
       image: amd64/rust
-      env:
-        # Disable full debug symbol generation to speed up CI build and keep memory down
-        # "1" means line tables only, which is useful for panic tracebacks.
-        RUSTFLAGS: "-C debuginfo=1"
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           submodules: true
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
-        with:
-          rust-version: stable
 
         # Run different tests for the library on its own as well as
         # all targets to ensure that it still works in the absence of
@@ -88,29 +81,42 @@ jobs:
         # 3. compiles with just arrow feature
         # 3. compiles with all features
       - name: Check compilation
-        run: |
-          cargo check -p parquet
+        run: cargo check -p parquet
       - name: Check compilation --no-default-features
-        run: |
-          cargo check -p parquet --no-default-features
+        run: cargo check -p parquet --no-default-features
       - name: Check compilation --no-default-features --features arrow
-        run: |
-          cargo check -p parquet --no-default-features --features arrow
+        run: cargo check -p parquet --no-default-features --features arrow
       - name: Check compilation --no-default-features --all-features
-        run: |
-          cargo check -p parquet --all-features
+        run: cargo check -p parquet --all-features
       - name: Check compilation --all-targets
-        run: |
-          cargo check -p parquet --all-targets
+        run: cargo check -p parquet --all-targets
       - name: Check compilation --all-targets --no-default-features
-        run: |
-          cargo check -p parquet --all-targets --no-default-features
+        run: cargo check -p parquet --all-targets --no-default-features
       - name: Check compilation  --all-targets --no-default-features --features arrow
-        run: |
-          cargo check -p parquet --all-targets --no-default-features --features arrow
+        run: cargo check -p parquet --all-targets --no-default-features --features arrow
       - name: Check compilation  --all-targets --all-features
-        run: |
-          cargo check -p parquet --all-targets --all-features
+        run: cargo check -p parquet --all-targets --all-features
+      - name: Check compilation  --all-targets --no-default-features --features json
+        run: cargo check -p parquet --all-targets --no-default-features --features json
+
+  # test the parquet crate builds against wasm32 in stable rust
+  wasm32-build:
+    name: Build wasm32
+    runs-on: ubuntu-latest
+    container:
+      image: amd64/rust
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: true
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+        with:
+          target: wasm32-unknown-unknown,wasm32-wasi
+      - name: Build wasm32-unknown-unknown
+        run: cargo build -p parquet --no-default-features --features cli,snap,flate2,brotli --target wasm32-unknown-unknown
+      - name: Build wasm32-wasi
+        run: cargo build -p parquet --no-default-features --features cli,snap,flate2,brotli --target wasm32-wasi
 
   clippy:
     name: Clippy
@@ -118,18 +124,10 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
-        with:
-          rust-version: stable
       - name: Setup Clippy
-        run: |
-          rustup component add clippy
+        run: rustup component add clippy
       - name: Run clippy
-        run: |
-          # Only run clippy for the library at this time,
-          # as there are clippy errors for other targets
-          cargo clippy -p parquet --all-features --lib -- -D warnings
-          # https://github.com/apache/arrow-rs/issues/1254
-          #cargo clippy -p parquet --all-targets --all-features -- -D warnings
+        run: cargo clippy -p parquet --all-targets --all-features -- -D warnings

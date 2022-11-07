@@ -78,13 +78,23 @@ where
 {
     /// Create a new [`GenericRecordReader`]
     pub fn new(desc: ColumnDescPtr) -> Self {
+        Self::new_with_records(desc, V::default())
+    }
+}
+
+impl<V, CV> GenericRecordReader<V, CV>
+where
+    V: ValuesBuffer,
+    CV: ColumnValueDecoder<Slice = V::Slice>,
+{
+    pub fn new_with_records(desc: ColumnDescPtr, records: V) -> Self {
         let def_levels = (desc.max_def_level() > 0)
             .then(|| DefinitionLevelBuffer::new(&desc, packed_null_mask(&desc)));
 
         let rep_levels = (desc.max_rep_level() > 0).then(ScalarBuffer::new);
 
         Self {
-            records: Default::default(),
+            records,
             def_levels,
             rep_levels,
             column_reader: None,
@@ -135,7 +145,11 @@ where
         loop {
             // Try to find some records from buffers that has been read into memory
             // but not counted as seen records.
-            let end_of_column = !self.column_reader.as_mut().unwrap().has_next()?;
+
+            // Check to see if the column is exhausted. Only peek the next page since in
+            // case we are reading to a page boundary and do not actually need to read
+            // the next page.
+            let end_of_column = !self.column_reader.as_mut().unwrap().peek_next()?;
 
             let (record_count, value_count) =
                 self.count_records(num_records - records_read, end_of_column);
@@ -144,7 +158,9 @@ where
             self.num_values += value_count;
             records_read += record_count;
 
-            if records_read == num_records || end_of_column {
+            if records_read == num_records
+                || !self.column_reader.as_mut().unwrap().has_next()?
+            {
                 break;
             }
 
@@ -188,7 +204,7 @@ where
     pub fn skip_records(&mut self, num_records: usize) -> Result<usize> {
         // First need to clear the buffer
         let end_of_column = match self.column_reader.as_mut() {
-            Some(reader) => !reader.has_next()?,
+            Some(reader) => !reader.peek_next()?,
             None => return Ok(0),
         };
 
@@ -197,12 +213,6 @@ where
 
         self.num_records += buffered_records;
         self.num_values += buffered_values;
-
-        self.consume_def_levels();
-        self.consume_rep_levels();
-        self.consume_record_data();
-        self.consume_bitmap();
-        self.reset();
 
         let remaining = num_records - buffered_records;
 
@@ -220,6 +230,7 @@ where
     }
 
     /// Returns number of records stored in buffer.
+    #[allow(unused)]
     pub fn num_records(&self) -> usize {
         self.num_records
     }
@@ -277,11 +288,6 @@ where
         self.def_levels
             .as_mut()
             .map(|levels| levels.split_bitmask(self.num_values))
-    }
-
-    /// Returns column reader.
-    pub(crate) fn column_reader(&self) -> Option<&ColumnReader<CV>> {
-        self.column_reader.as_ref()
     }
 
     /// Try to read one batch of data.
@@ -795,5 +801,187 @@ mod tests {
         assert_eq!(record_reader.read_records(4).unwrap(), 0);
         assert_eq!(record_reader.num_records(), 8);
         assert_eq!(record_reader.num_values(), 14);
+    }
+
+    #[test]
+    fn test_skip_required_records() {
+        // Construct column schema
+        let message_type = "
+        message test_schema {
+          REQUIRED INT32 leaf;
+        }
+        ";
+        let desc = parse_message_type(message_type)
+            .map(|t| SchemaDescriptor::new(Arc::new(t)))
+            .map(|s| s.column(0))
+            .unwrap();
+
+        // Construct record reader
+        let mut record_reader = RecordReader::<Int32Type>::new(desc.clone());
+
+        // First page
+
+        // Records data:
+        // test_schema
+        //   leaf: 4
+        // test_schema
+        //   leaf: 7
+        // test_schema
+        //   leaf: 6
+        // test_schema
+        //   left: 3
+        // test_schema
+        //   left: 2
+        {
+            let values = [4, 7, 6, 3, 2];
+            let mut pb = DataPageBuilderImpl::new(desc.clone(), 5, true);
+            pb.add_values::<Int32Type>(Encoding::PLAIN, &values);
+            let page = pb.consume();
+
+            let page_reader = Box::new(InMemoryPageReader::new(vec![page]));
+            record_reader.set_page_reader(page_reader).unwrap();
+            assert_eq!(2, record_reader.skip_records(2).unwrap());
+            assert_eq!(0, record_reader.num_records());
+            assert_eq!(0, record_reader.num_values());
+            assert_eq!(3, record_reader.read_records(3).unwrap());
+            assert_eq!(3, record_reader.num_records());
+            assert_eq!(3, record_reader.num_values());
+        }
+
+        // Second page
+
+        // Records data:
+        // test_schema
+        //   leaf: 8
+        // test_schema
+        //   leaf: 9
+        {
+            let values = [8, 9];
+            let mut pb = DataPageBuilderImpl::new(desc, 2, true);
+            pb.add_values::<Int32Type>(Encoding::PLAIN, &values);
+            let page = pb.consume();
+
+            let page_reader = Box::new(InMemoryPageReader::new(vec![page]));
+            record_reader.set_page_reader(page_reader).unwrap();
+            assert_eq!(2, record_reader.skip_records(10).unwrap());
+            assert_eq!(3, record_reader.num_records());
+            assert_eq!(3, record_reader.num_values());
+            assert_eq!(0, record_reader.read_records(10).unwrap());
+        }
+
+        let mut bb = Int32BufferBuilder::new(3);
+        bb.append_slice(&[6, 3, 2]);
+        let expected_buffer = bb.finish();
+        assert_eq!(expected_buffer, record_reader.consume_record_data());
+        assert_eq!(None, record_reader.consume_def_levels());
+        assert_eq!(None, record_reader.consume_bitmap());
+    }
+
+    #[test]
+    fn test_skip_optional_records() {
+        // Construct column schema
+        let message_type = "
+        message test_schema {
+          OPTIONAL Group test_struct {
+            OPTIONAL INT32 leaf;
+          }
+        }
+        ";
+
+        let desc = parse_message_type(message_type)
+            .map(|t| SchemaDescriptor::new(Arc::new(t)))
+            .map(|s| s.column(0))
+            .unwrap();
+
+        // Construct record reader
+        let mut record_reader = RecordReader::<Int32Type>::new(desc.clone());
+
+        // First page
+
+        // Records data:
+        // test_schema
+        //   test_struct
+        // test_schema
+        //   test_struct
+        //     leaf: 7
+        // test_schema
+        // test_schema
+        //   test_struct
+        //     leaf: 6
+        // test_schema
+        //   test_struct
+        //     leaf: 6
+        {
+            let values = [7, 6, 3];
+            //empty, non-empty, empty, non-empty, non-empty
+            let def_levels = [1i16, 2i16, 0i16, 2i16, 2i16];
+            let mut pb = DataPageBuilderImpl::new(desc.clone(), 5, true);
+            pb.add_def_levels(2, &def_levels);
+            pb.add_values::<Int32Type>(Encoding::PLAIN, &values);
+            let page = pb.consume();
+
+            let page_reader = Box::new(InMemoryPageReader::new(vec![page]));
+            record_reader.set_page_reader(page_reader).unwrap();
+            assert_eq!(2, record_reader.skip_records(2).unwrap());
+            assert_eq!(0, record_reader.num_records());
+            assert_eq!(0, record_reader.num_values());
+            assert_eq!(3, record_reader.read_records(3).unwrap());
+            assert_eq!(3, record_reader.num_records());
+            assert_eq!(3, record_reader.num_values());
+        }
+
+        // Second page
+
+        // Records data:
+        // test_schema
+        // test_schema
+        //   test_struct
+        //     left: 8
+        {
+            let values = [8];
+            //empty, non-empty
+            let def_levels = [0i16, 2i16];
+            let mut pb = DataPageBuilderImpl::new(desc, 2, true);
+            pb.add_def_levels(2, &def_levels);
+            pb.add_values::<Int32Type>(Encoding::PLAIN, &values);
+            let page = pb.consume();
+
+            let page_reader = Box::new(InMemoryPageReader::new(vec![page]));
+            record_reader.set_page_reader(page_reader).unwrap();
+            assert_eq!(2, record_reader.skip_records(10).unwrap());
+            assert_eq!(3, record_reader.num_records());
+            assert_eq!(3, record_reader.num_values());
+            assert_eq!(0, record_reader.read_records(10).unwrap());
+        }
+
+        // Verify result def levels
+        let mut bb = Int16BufferBuilder::new(7);
+        bb.append_slice(&[0i16, 2i16, 2i16]);
+        let expected_def_levels = bb.finish();
+        assert_eq!(
+            Some(expected_def_levels),
+            record_reader.consume_def_levels()
+        );
+
+        // Verify bitmap
+        let expected_valid = &[false, true, true];
+        let expected_buffer = Buffer::from_iter(expected_valid.iter().cloned());
+        let expected_bitmap = Bitmap::from(expected_buffer);
+        assert_eq!(Some(expected_bitmap), record_reader.consume_bitmap());
+
+        // Verify result record data
+        let actual = record_reader.consume_record_data();
+        let actual_values = actual.typed_data::<i32>();
+
+        let expected = &[0, 6, 3];
+        assert_eq!(actual_values.len(), expected.len());
+
+        // Only validate valid values are equal
+        let iter = expected_valid.iter().zip(actual_values).zip(expected);
+        for ((valid, actual), expected) in iter {
+            if *valid {
+                assert_eq!(actual, expected)
+            }
+        }
     }
 }

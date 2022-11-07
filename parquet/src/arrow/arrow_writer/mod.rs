@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 use arrow::array as arrow_array;
 use arrow::array::ArrayRef;
-use arrow::array::BasicDecimalArray;
 use arrow::datatypes::{DataType as ArrowDataType, IntervalUnit, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_array::Array;
@@ -33,69 +32,17 @@ use super::schema::{
     decimal_length_from_precision,
 };
 
-use crate::column::writer::{get_column_writer, ColumnWriter, ColumnWriterImpl};
+use crate::arrow::arrow_writer::byte_array::ByteArrayWriter;
+use crate::column::writer::{ColumnWriter, ColumnWriterImpl};
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::RowGroupMetaDataPtr;
 use crate::file::properties::WriterProperties;
-use crate::file::writer::{SerializedColumnWriter, SerializedRowGroupWriter};
+use crate::file::writer::SerializedRowGroupWriter;
 use crate::{data_type::*, file::writer::SerializedFileWriter};
 use levels::{calculate_array_levels, LevelInfo};
 
 mod byte_array;
 mod levels;
-
-/// An object-safe API for writing an [`ArrayRef`]
-trait ArrayWriter {
-    fn write(&mut self, array: &ArrayRef, levels: LevelInfo) -> Result<()>;
-
-    fn close(&mut self) -> Result<()>;
-}
-
-/// Fallback implementation for writing an [`ArrayRef`] that uses [`SerializedColumnWriter`]
-struct ColumnArrayWriter<'a>(Option<SerializedColumnWriter<'a>>);
-
-impl<'a> ArrayWriter for ColumnArrayWriter<'a> {
-    fn write(&mut self, array: &ArrayRef, levels: LevelInfo) -> Result<()> {
-        write_leaf(self.0.as_mut().unwrap().untyped(), array, levels)?;
-        Ok(())
-    }
-
-    fn close(&mut self) -> Result<()> {
-        self.0.take().unwrap().close()
-    }
-}
-
-fn get_writer<'a, W: Write>(
-    row_group_writer: &'a mut SerializedRowGroupWriter<'_, W>,
-    data_type: &ArrowDataType,
-) -> Result<Box<dyn ArrayWriter + 'a>> {
-    let array_writer = row_group_writer
-        .next_column_with_factory(
-            |descr, props, page_writer, on_close| match data_type {
-                ArrowDataType::Utf8
-                | ArrowDataType::LargeUtf8
-                | ArrowDataType::Binary
-                | ArrowDataType::LargeBinary => Ok(byte_array::make_byte_array_writer(
-                    descr,
-                    data_type.clone(),
-                    props.clone(),
-                    page_writer,
-                    on_close,
-                )),
-                _ => {
-                    let column_writer =
-                        get_column_writer(descr, props.clone(), page_writer);
-
-                    let serialized_writer =
-                        SerializedColumnWriter::new(column_writer, Some(on_close));
-
-                    Ok(Box::new(ColumnArrayWriter(Some(serialized_writer))))
-                }
-            },
-        )?
-        .expect("Unable to get column writer");
-    Ok(array_writer)
-}
 
 /// Arrow writer
 ///
@@ -276,8 +223,14 @@ impl<W: Write> ArrowWriter<W> {
         Ok(())
     }
 
+    /// Flushes any outstanding data and returns the underlying writer.
+    pub fn into_inner(mut self) -> Result<W> {
+        self.flush()?;
+        self.writer.into_inner()
+    }
+
     /// Close and finalize the underlying Parquet writer
-    pub fn close(mut self) -> Result<parquet_format::FileMetaData> {
+    pub fn close(mut self) -> Result<crate::format::FileMetaData> {
         self.flush()?;
         self.writer.close()
     }
@@ -314,22 +267,24 @@ fn write_leaves<W: Write>(
         | ArrowDataType::Time64(_)
         | ArrowDataType::Duration(_)
         | ArrowDataType::Interval(_)
-        | ArrowDataType::LargeBinary
-        | ArrowDataType::Binary
-        | ArrowDataType::Utf8
-        | ArrowDataType::LargeUtf8
         | ArrowDataType::Decimal128(_, _)
         | ArrowDataType::Decimal256(_, _)
         | ArrowDataType::FixedSizeBinary(_) => {
-            let mut writer = get_writer(row_group_writer, &data_type)?;
+            let mut col_writer = row_group_writer.next_column()?.unwrap();
             for (array, levels) in arrays.iter().zip(levels.iter_mut()) {
-                writer.write(
-                    array,
-                    levels.pop().expect("Levels exhausted"),
-                )?;
+                write_leaf(col_writer.untyped(), array, levels.pop().expect("Levels exhausted"))?;
             }
-            writer.close()?;
-            Ok(())
+            col_writer.close()
+        }
+        ArrowDataType::LargeBinary
+        | ArrowDataType::Binary
+        | ArrowDataType::Utf8
+        | ArrowDataType::LargeUtf8 => {
+            let mut col_writer = row_group_writer.next_column_with_factory(ByteArrayWriter::new)?.unwrap();
+            for (array, levels) in arrays.iter().zip(levels.iter_mut()) {
+                col_writer.write(array, levels.pop().expect("Levels exhausted"))?;
+            }
+            col_writer.close()
         }
         ArrowDataType::List(_) | ArrowDataType::LargeList(_) => {
             let arrays: Vec<_> = arrays.iter().map(|array|{
@@ -380,18 +335,21 @@ fn write_leaves<W: Write>(
             write_leaves(row_group_writer, &values, levels)?;
             Ok(())
         }
-        ArrowDataType::Dictionary(_, value_type) => {
-            let mut writer = get_writer(row_group_writer, value_type)?;
-            for (array, levels) in arrays.iter().zip(levels.iter_mut()) {
-                // cast dictionary to a primitive
-                let array = arrow::compute::cast(array, value_type)?;
-                writer.write(
-                    &array,
-                    levels.pop().expect("Levels exhausted"),
-                )?;
+        ArrowDataType::Dictionary(_, value_type) => match value_type.as_ref() {
+            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Binary | ArrowDataType::LargeBinary => {
+                let mut col_writer = row_group_writer.next_column_with_factory(ByteArrayWriter::new)?.unwrap();
+                for (array, levels) in arrays.iter().zip(levels.iter_mut()) {
+                    col_writer.write(array, levels.pop().expect("Levels exhausted"))?;
+                }
+                col_writer.close()
             }
-            writer.close()?;
-            Ok(())
+            _ => {
+                let mut col_writer = row_group_writer.next_column()?.unwrap();
+                for (array, levels) in arrays.iter().zip(levels.iter_mut()) {
+                    write_leaf(col_writer.untyped(), array, levels.pop().expect("Levels exhausted"))?;
+                }
+                col_writer.close()
+            }
         }
         ArrowDataType::Float16 => Err(ParquetError::ArrowError(
             "Float16 arrays not supported".to_string(),
@@ -627,7 +585,7 @@ fn get_decimal_array_slice(
     let mut values = Vec::with_capacity(indices.len());
     let size = decimal_length_from_precision(array.precision());
     for i in indices {
-        let as_be_bytes = array.value(*i).as_i128().to_be_bytes();
+        let as_be_bytes = array.value(*i).to_be_bytes();
         let resized_value = as_be_bytes[(16 - size)..].to_vec();
         values.push(FixedLenByteArray::from(ByteArray::from(resized_value)));
     }
@@ -654,6 +612,9 @@ mod tests {
     use std::fs::File;
     use std::sync::Arc;
 
+    use crate::arrow::arrow_reader::{
+        ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
+    };
     use arrow::datatypes::ToByteSlice;
     use arrow::datatypes::{DataType, Field, Schema, UInt32Type, UInt8Type};
     use arrow::error::Result as ArrowResult;
@@ -661,9 +622,9 @@ mod tests {
     use arrow::util::pretty::pretty_format_batches;
     use arrow::{array::*, buffer::Buffer};
 
-    use crate::arrow::{ArrowReader, ParquetFileArrowReader};
     use crate::basic::Encoding;
     use crate::file::metadata::ParquetMetaData;
+    use crate::file::page_index::index_reader::read_pages_locations;
     use crate::file::properties::WriterVersion;
     use crate::file::{
         reader::{FileReader, SerializedFileReader},
@@ -690,6 +651,25 @@ mod tests {
         roundtrip(batch, Some(SMALL_SIZE / 2));
     }
 
+    fn get_bytes_after_close(schema: SchemaRef, expected_batch: &RecordBatch) -> Vec<u8> {
+        let mut buffer = vec![];
+
+        let mut writer = ArrowWriter::try_new(&mut buffer, schema, None).unwrap();
+        writer.write(expected_batch).unwrap();
+        writer.close().unwrap();
+
+        buffer
+    }
+
+    fn get_bytes_by_into_inner(
+        schema: SchemaRef,
+        expected_batch: &RecordBatch,
+    ) -> Vec<u8> {
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+        writer.write(expected_batch).unwrap();
+        writer.into_inner().unwrap()
+    }
+
     #[test]
     fn roundtrip_bytes() {
         // define schema
@@ -706,31 +686,28 @@ mod tests {
         let expected_batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(a), Arc::new(b)]).unwrap();
 
-        let mut buffer = vec![];
+        for buffer in vec![
+            get_bytes_after_close(schema.clone(), &expected_batch),
+            get_bytes_by_into_inner(schema, &expected_batch),
+        ] {
+            let cursor = Bytes::from(buffer);
+            let mut record_batch_reader =
+                ParquetRecordBatchReader::try_new(cursor, 1024).unwrap();
 
-        {
-            let mut writer = ArrowWriter::try_new(&mut buffer, schema, None).unwrap();
-            writer.write(&expected_batch).unwrap();
-            writer.close().unwrap();
-        }
+            let actual_batch = record_batch_reader
+                .next()
+                .expect("No batch found")
+                .expect("Unable to get batch");
 
-        let cursor = Bytes::from(buffer);
-        let mut arrow_reader = ParquetFileArrowReader::try_new(cursor).unwrap();
-        let mut record_batch_reader = arrow_reader.get_record_reader(1024).unwrap();
+            assert_eq!(expected_batch.schema(), actual_batch.schema());
+            assert_eq!(expected_batch.num_columns(), actual_batch.num_columns());
+            assert_eq!(expected_batch.num_rows(), actual_batch.num_rows());
+            for i in 0..expected_batch.num_columns() {
+                let expected_data = expected_batch.column(i).data().clone();
+                let actual_data = actual_batch.column(i).data().clone();
 
-        let actual_batch = record_batch_reader
-            .next()
-            .expect("No batch found")
-            .expect("Unable to get batch");
-
-        assert_eq!(expected_batch.schema(), actual_batch.schema());
-        assert_eq!(expected_batch.num_columns(), actual_batch.num_columns());
-        assert_eq!(expected_batch.num_rows(), actual_batch.num_rows());
-        for i in 0..expected_batch.num_columns() {
-            let expected_data = expected_batch.column(i).data().clone();
-            let actual_data = actual_batch.column(i).data().clone();
-
-            assert_eq!(expected_data, actual_data);
+                assert_eq!(expected_data, actual_data);
+            }
         }
     }
 
@@ -1132,6 +1109,71 @@ mod tests {
         roundtrip(batch, Some(SMALL_SIZE / 2));
     }
 
+    #[test]
+    fn arrow_writer_page_size() {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, false)]));
+
+        let mut builder = StringBuilder::with_capacity(100, 329 * 10_000);
+
+        // Generate an array of 10 unique 10 character string
+        for i in 0..10 {
+            let value = i
+                .to_string()
+                .repeat(10)
+                .chars()
+                .take(10)
+                .collect::<String>();
+
+            builder.append_value(value);
+        }
+
+        let array = Arc::new(builder.finish());
+
+        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+
+        let file = tempfile::tempfile().unwrap();
+
+        // Set everything very low so we fallback to PLAIN encoding after the first row
+        let props = WriterProperties::builder()
+            .set_data_pagesize_limit(1)
+            .set_dictionary_pagesize_limit(1)
+            .set_write_batch_size(1)
+            .build();
+
+        let mut writer =
+            ArrowWriter::try_new(file.try_clone().unwrap(), batch.schema(), Some(props))
+                .expect("Unable to write file");
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let reader = SerializedFileReader::new(file.try_clone().unwrap()).unwrap();
+
+        let column = reader.metadata().row_group(0).columns();
+
+        assert_eq!(column.len(), 1);
+
+        // We should write one row before falling back to PLAIN encoding so there should still be a
+        // dictionary page.
+        assert!(
+            column[0].dictionary_page_offset().is_some(),
+            "Expected a dictionary page"
+        );
+
+        let page_locations = read_pages_locations(&file, column).unwrap();
+
+        let offset_index = page_locations[0].clone();
+
+        // We should fallback to PLAIN encoding after the first row and our max page size is 1 bytes
+        // so we expect one dictionary encoded page and then a page per row thereafter.
+        assert_eq!(
+            offset_index.len(),
+            10,
+            "Expected 9 pages but got {:#?}",
+            offset_index
+        );
+    }
+
     const SMALL_SIZE: usize = 7;
 
     fn roundtrip(
@@ -1161,12 +1203,11 @@ mod tests {
             Some(props),
         )
         .expect("Unable to write file");
-        writer.write(&expected_batch).unwrap();
+        writer.write(expected_batch).unwrap();
         writer.close().unwrap();
 
-        let mut arrow_reader =
-            ParquetFileArrowReader::try_new(file.try_clone().unwrap()).unwrap();
-        let mut record_batch_reader = arrow_reader.get_record_reader(1024).unwrap();
+        let mut record_batch_reader =
+            ParquetRecordBatchReader::try_new(file.try_clone().unwrap(), 1024).unwrap();
 
         let actual_batch = record_batch_reader
             .next()
@@ -1376,7 +1417,7 @@ mod tests {
     #[test]
     fn timestamp_second_single_column() {
         let raw_values: Vec<_> = (0..SMALL_SIZE as i64).collect();
-        let values = Arc::new(TimestampSecondArray::from_vec(raw_values, None));
+        let values = Arc::new(TimestampSecondArray::from(raw_values));
 
         one_column_roundtrip(values, false);
     }
@@ -1384,7 +1425,7 @@ mod tests {
     #[test]
     fn timestamp_millisecond_single_column() {
         let raw_values: Vec<_> = (0..SMALL_SIZE as i64).collect();
-        let values = Arc::new(TimestampMillisecondArray::from_vec(raw_values, None));
+        let values = Arc::new(TimestampMillisecondArray::from(raw_values));
 
         one_column_roundtrip(values, false);
     }
@@ -1392,7 +1433,7 @@ mod tests {
     #[test]
     fn timestamp_microsecond_single_column() {
         let raw_values: Vec<_> = (0..SMALL_SIZE as i64).collect();
-        let values = Arc::new(TimestampMicrosecondArray::from_vec(raw_values, None));
+        let values = Arc::new(TimestampMicrosecondArray::from(raw_values));
 
         one_column_roundtrip(values, false);
     }
@@ -1400,7 +1441,7 @@ mod tests {
     #[test]
     fn timestamp_nanosecond_single_column() {
         let raw_values: Vec<_> = (0..SMALL_SIZE as i64).collect();
-        let values = Arc::new(TimestampNanosecondArray::from_vec(raw_values, None));
+        let values = Arc::new(TimestampNanosecondArray::from(raw_values));
 
         one_column_roundtrip(values, false);
     }
@@ -1502,7 +1543,7 @@ mod tests {
 
     #[test]
     fn fixed_size_binary_single_column() {
-        let mut builder = FixedSizeBinaryBuilder::new(16, 4);
+        let mut builder = FixedSizeBinaryBuilder::new(4);
         builder.append_value(b"0123").unwrap();
         builder.append_null();
         builder.append_value(b"8910").unwrap();
@@ -1678,9 +1719,7 @@ mod tests {
         )]));
 
         // create some data
-        let key_builder = PrimitiveBuilder::<UInt8Type>::new(3);
-        let value_builder = PrimitiveBuilder::<UInt32Type>::new(2);
-        let mut builder = PrimitiveDictionaryBuilder::new(key_builder, value_builder);
+        let mut builder = PrimitiveDictionaryBuilder::<UInt8Type, UInt32Type>::new();
         builder.append(12345678).unwrap();
         builder.append_null();
         builder.append(22345678).unwrap();
@@ -1817,8 +1856,8 @@ mod tests {
         let int_field = Field::new("a", DataType::Int32, true);
         let int_field2 = Field::new("b", DataType::Int32, true);
 
-        let int_builder = Int32Builder::new(10);
-        let int_builder2 = Int32Builder::new(10);
+        let int_builder = Int32Builder::with_capacity(10);
+        let int_builder2 = Int32Builder::with_capacity(10);
 
         let struct_builder = StructBuilder::new(
             vec![int_field, int_field2],
@@ -1937,11 +1976,12 @@ mod tests {
 
         writer.close().unwrap();
 
-        let mut arrow_reader = ParquetFileArrowReader::try_new(file).unwrap();
-        assert_eq!(&row_group_sizes(arrow_reader.metadata()), &[200, 200, 50]);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        assert_eq!(&row_group_sizes(builder.metadata()), &[200, 200, 50]);
 
-        let batches = arrow_reader
-            .get_record_reader(100)
+        let batches = builder
+            .with_batch_size(100)
+            .build()
             .unwrap()
             .collect::<ArrowResult<Vec<_>>>()
             .unwrap();
@@ -2082,11 +2122,12 @@ mod tests {
         // Should have written entire first batch and first row of second to the first row group
         // leaving a single row in the second row group
 
-        let mut arrow_reader = ParquetFileArrowReader::try_new(file).unwrap();
-        assert_eq!(&row_group_sizes(arrow_reader.metadata()), &[6, 1]);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        assert_eq!(&row_group_sizes(builder.metadata()), &[6, 1]);
 
-        let batches = arrow_reader
-            .get_record_reader(2)
+        let batches = builder
+            .with_batch_size(2)
+            .build()
             .unwrap()
             .collect::<ArrowResult<Vec<_>>>()
             .unwrap();

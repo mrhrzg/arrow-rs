@@ -19,8 +19,8 @@ use crate::basic::Type;
 use crate::data_type::private::ParquetValueType;
 use crate::data_type::Int96;
 use crate::errors::ParquetError;
+use crate::format::{BoundaryOrder, ColumnIndex};
 use crate::util::bit_util::from_le_slice;
-use parquet_format::{BoundaryOrder, ColumnIndex};
 use std::fmt::Debug;
 
 /// The statistics in one page
@@ -47,6 +47,7 @@ impl<T> PageIndex<T> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(non_camel_case_types)]
 pub enum Index {
     /// Sometimes reading page index from parquet file
     /// will only return pageLocations without min_max index,
@@ -60,6 +61,33 @@ pub enum Index {
     DOUBLE(NativeIndex<f64>),
     BYTE_ARRAY(ByteArrayIndex),
     FIXED_LEN_BYTE_ARRAY(ByteArrayIndex),
+}
+
+impl Index {
+    /// Return min/max elements inside ColumnIndex are ordered or not.
+    pub fn is_sorted(&self) -> bool {
+        // 0:UNORDERED, 1:ASCENDING ,2:DESCENDING,
+        if let Some(order) = self.get_boundary_order() {
+            order.0 > (BoundaryOrder::UNORDERED.0)
+        } else {
+            false
+        }
+    }
+
+    /// Get boundary_order of this page index.
+    pub fn get_boundary_order(&self) -> Option<BoundaryOrder> {
+        match self {
+            Index::NONE => None,
+            Index::BOOLEAN(index) => Some(index.boundary_order),
+            Index::INT32(index) => Some(index.boundary_order),
+            Index::INT64(index) => Some(index.boundary_order),
+            Index::INT96(index) => Some(index.boundary_order),
+            Index::FLOAT(index) => Some(index.boundary_order),
+            Index::DOUBLE(index) => Some(index.boundary_order),
+            Index::BYTE_ARRAY(index) => Some(index.boundary_order),
+            Index::FIXED_LEN_BYTE_ARRAY(index) => Some(index.boundary_order),
+        }
+    }
 }
 
 /// An index of a column of [`Type`] physical representation

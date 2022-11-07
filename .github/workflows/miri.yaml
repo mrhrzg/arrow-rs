@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: MIRI
+name: miri
 
 # trigger for all PRs that touch certain files and changes to master
 on:
@@ -25,6 +25,13 @@ on:
   pull_request:
     paths:
       - arrow/**
+      - arrow-array/**
+      - arrow-buffer/**
+      - arrow-cast/**
+      - arrow-data/**
+      - arrow-schema/**
+      - arrow-select/**
+      - arrow-ipc/**
       - .github/**
 
 jobs:
@@ -32,7 +39,7 @@ jobs:
     name: MIRI
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           submodules: true
       - name: Setup Rust toolchain
@@ -44,5 +51,4 @@ jobs:
         env:
           RUST_BACKTRACE: full
           RUST_LOG: "trace"
-        run: |
-          bash .github/workflows/miri.sh
+        run: bash .github/workflows/miri.sh

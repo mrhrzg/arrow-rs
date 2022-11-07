@@ -34,7 +34,6 @@ use std::sync::Arc;
 pub struct ListArrayReader<OffsetSize: OffsetSizeTrait> {
     item_reader: Box<dyn ArrayReader>,
     data_type: ArrowType,
-    item_type: ArrowType,
     /// The definition level at which this list is not null
     def_level: i16,
     /// The repetition level that corresponds to a new value in this array
@@ -49,7 +48,6 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
     pub fn new(
         item_reader: Box<dyn ArrayReader>,
         data_type: ArrowType,
-        item_type: ArrowType,
         def_level: i16,
         rep_level: i16,
         nullable: bool,
@@ -57,7 +55,6 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
         Self {
             item_reader,
             data_type,
-            item_type,
             def_level,
             rep_level,
             nullable,
@@ -78,9 +75,13 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
         &self.data_type
     }
 
-    fn next_batch(&mut self, batch_size: usize) -> Result<ArrayRef> {
-        let next_batch_array = self.item_reader.next_batch(batch_size)?;
+    fn read_records(&mut self, batch_size: usize) -> Result<usize> {
+        let size = self.item_reader.read_records(batch_size)?;
+        Ok(size)
+    }
 
+    fn consume_batch(&mut self) -> Result<ArrayRef> {
+        let next_batch_array = self.item_reader.consume_batch()?;
         if next_batch_array.len() == 0 {
             return Ok(new_empty_array(&self.data_type));
         }
@@ -250,6 +251,7 @@ mod tests {
     use crate::arrow::array_reader::build_array_reader;
     use crate::arrow::array_reader::list_array::ListArrayReader;
     use crate::arrow::array_reader::test_util::InMemoryArrayReader;
+    use crate::arrow::schema::parquet_to_array_schema_and_fields;
     use crate::arrow::{parquet_to_arrow_schema, ArrowWriter, ProjectionMask};
     use crate::file::properties::WriterProperties;
     use crate::file::reader::{FileReader, SerializedFileReader};
@@ -264,10 +266,7 @@ mod tests {
         item_nullable: bool,
     ) -> ArrowType {
         let field = Box::new(Field::new("item", data_type, item_nullable));
-        match OffsetSize::IS_LARGE {
-            true => ArrowType::LargeList(field),
-            false => ArrowType::List(field),
-        }
+        GenericListArray::<OffsetSize>::DATA_TYPE_CONSTRUCTOR(field)
     }
 
     fn downcast<OffsetSize: OffsetSizeTrait>(
@@ -303,13 +302,13 @@ mod tests {
         // ]
 
         let l3_item_type = ArrowType::Int32;
-        let l3_type = list_type::<OffsetSize>(l3_item_type.clone(), true);
+        let l3_type = list_type::<OffsetSize>(l3_item_type, true);
 
         let l2_item_type = l3_type.clone();
-        let l2_type = list_type::<OffsetSize>(l2_item_type.clone(), true);
+        let l2_type = list_type::<OffsetSize>(l2_item_type, true);
 
         let l1_item_type = l2_type.clone();
-        let l1_type = list_type::<OffsetSize>(l1_item_type.clone(), false);
+        let l1_type = list_type::<OffsetSize>(l1_item_type, false);
 
         let leaf = PrimitiveArray::<Int32Type>::from_iter(vec![
             Some(1),
@@ -386,29 +385,15 @@ mod tests {
         let l3 = ListArrayReader::<OffsetSize>::new(
             Box::new(item_array_reader),
             l3_type,
-            l3_item_type,
             5,
             3,
             true,
         );
 
-        let l2 = ListArrayReader::<OffsetSize>::new(
-            Box::new(l3),
-            l2_type,
-            l2_item_type,
-            3,
-            2,
-            false,
-        );
+        let l2 = ListArrayReader::<OffsetSize>::new(Box::new(l3), l2_type, 3, 2, false);
 
-        let mut l1 = ListArrayReader::<OffsetSize>::new(
-            Box::new(l2),
-            l1_type,
-            l1_item_type,
-            2,
-            1,
-            true,
-        );
+        let mut l1 =
+            ListArrayReader::<OffsetSize>::new(Box::new(l2), l1_type, 2, 1, true);
 
         let expected_1 = expected.slice(0, 2);
         let expected_2 = expected.slice(2, 2);
@@ -455,7 +440,6 @@ mod tests {
         let mut list_array_reader = ListArrayReader::<OffsetSize>::new(
             Box::new(item_array_reader),
             list_type::<OffsetSize>(ArrowType::Int32, true),
-            ArrowType::Int32,
             1,
             1,
             false,
@@ -508,7 +492,6 @@ mod tests {
         let mut list_array_reader = ListArrayReader::<OffsetSize>::new(
             Box::new(item_array_reader),
             list_type::<OffsetSize>(ArrowType::Int32, true),
-            ArrowType::Int32,
             2,
             1,
             true,
@@ -580,22 +563,17 @@ mod tests {
             Arc::new(SerializedFileReader::new(file).unwrap());
 
         let file_metadata = file_reader.metadata().file_metadata();
-        let arrow_schema = parquet_to_arrow_schema(
-            file_metadata.schema_descr(),
+        let schema = file_metadata.schema_descr();
+        let mask = ProjectionMask::leaves(schema, vec![0]);
+        let (_, fields) = parquet_to_array_schema_and_fields(
+            schema,
+            ProjectionMask::all(),
             file_metadata.key_value_metadata(),
         )
         .unwrap();
 
-        let schema = file_metadata.schema_descr_ptr();
-        let mask = ProjectionMask::leaves(&schema, vec![0]);
-
-        let mut array_reader = build_array_reader(
-            schema,
-            Arc::new(arrow_schema),
-            mask,
-            Box::new(file_reader),
-        )
-        .unwrap();
+        let mut array_reader =
+            build_array_reader(fields.as_ref(), &mask, &file_reader).unwrap();
 
         let batch = array_reader.next_batch(100).unwrap();
         assert_eq!(batch.data_type(), array_reader.get_data_type());

@@ -47,10 +47,7 @@ pub fn create_random_batch(
     RecordBatch::try_new_with_options(
         schema,
         columns,
-        &RecordBatchOptions {
-            match_field_names: false,
-            row_count: None,
-        },
+        &RecordBatchOptions::new().with_match_field_names(false),
     )
 }
 
@@ -143,6 +140,17 @@ pub fn create_random_array(
                 })
                 .collect::<Result<Vec<(&str, ArrayRef)>>>()?,
         )?),
+        d @ Dictionary(_, value_type)
+            if crate::compute::can_cast_types(value_type, d) =>
+        {
+            let f = Field::new(
+                field.name(),
+                value_type.as_ref().clone(),
+                field.is_nullable(),
+            );
+            let v = create_random_array(&f, size, null_density, true_density)?;
+            crate::compute::cast(&v, d)?
+        }
         other => {
             return Err(ArrowError::NotYetImplemented(format!(
                 "Generating random arrays not yet implemented for {:?}",

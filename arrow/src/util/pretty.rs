@@ -19,9 +19,8 @@
 //! available unless `feature = "prettyprint"` is enabled.
 
 use crate::{array::ArrayRef, record_batch::RecordBatch};
-use std::fmt::Display;
-
 use comfy_table::{Cell, Table};
+use std::fmt::Display;
 
 use crate::error::Result;
 
@@ -65,7 +64,7 @@ fn create_table(results: &[RecordBatch]) -> Result<Table> {
 
     let mut header = Vec::new();
     for field in schema.fields() {
-        header.push(Cell::new(&field.name()));
+        header.push(Cell::new(field.name()));
     }
     table.set_header(header);
 
@@ -109,10 +108,10 @@ mod tests {
     use crate::{
         array::{
             self, new_null_array, Array, Date32Array, Date64Array,
-            FixedSizeBinaryBuilder, Float16Array, Int32Array, PrimitiveBuilder,
-            StringArray, StringBuilder, StringDictionaryBuilder, StructArray,
-            Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
-            Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+            FixedSizeBinaryBuilder, Float16Array, Int32Array, StringArray,
+            StringDictionaryBuilder, StructArray, Time32MillisecondArray,
+            Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+            TimestampMicrosecondArray, TimestampMillisecondArray,
             TimestampNanosecondArray, TimestampSecondArray, UnionArray, UnionBuilder,
         },
         buffer::Buffer,
@@ -242,9 +241,7 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
         let schema = Arc::new(Schema::new(vec![Field::new("d1", field_type, true)]));
 
-        let keys_builder = PrimitiveBuilder::<Int32Type>::new(10);
-        let values_builder = StringBuilder::new(10);
-        let mut builder = StringDictionaryBuilder::new(keys_builder, values_builder);
+        let mut builder = StringDictionaryBuilder::<Int32Type>::new();
 
         builder.append("one")?;
         builder.append_null();
@@ -318,11 +315,11 @@ mod tests {
         let field_type = DataType::FixedSizeBinary(3);
         let schema = Arc::new(Schema::new(vec![Field::new("d1", field_type, true)]));
 
-        let mut builder = FixedSizeBinaryBuilder::new(3, 3);
+        let mut builder = FixedSizeBinaryBuilder::with_capacity(3, 3);
 
-        builder.append_value(&[1, 2, 3]).unwrap();
+        builder.append_value([1, 2, 3]).unwrap();
         builder.append_null();
-        builder.append_value(&[7, 8, 9]).unwrap();
+        builder.append_value([7, 8, 9]).unwrap();
 
         let array = Arc::new(builder.finish());
 
@@ -373,13 +370,134 @@ mod tests {
         };
     }
 
+    /// Generate an array with type $ARRAYTYPE with a numeric value of
+    /// $VALUE, and compare $EXPECTED_RESULT to the output of
+    /// formatting that array with `pretty_format_batches`
+    macro_rules! check_datetime_with_timezone {
+        ($ARRAYTYPE:ident, $VALUE:expr, $TZ_STRING:expr, $EXPECTED_RESULT:expr) => {
+            let mut builder = $ARRAYTYPE::builder(10);
+            builder.append_value($VALUE);
+            builder.append_null();
+            let array = builder.finish();
+            let array = array.with_timezone($TZ_STRING);
+
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "f",
+                array.data_type().clone(),
+                true,
+            )]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+
+            let table = pretty_format_batches(&[batch])
+                .expect("formatting batches")
+                .to_string();
+
+            let expected = $EXPECTED_RESULT;
+            let actual: Vec<&str> = table.lines().collect();
+
+            assert_eq!(expected, actual, "Actual result:\n\n{:#?}\n\n", actual);
+        };
+    }
+
+    #[test]
+    #[cfg(features = "chrono-tz")]
+    fn test_pretty_format_timestamp_second_with_utc_timezone() {
+        let expected = vec![
+            "+---------------------------+",
+            "| f                         |",
+            "+---------------------------+",
+            "| 1970-05-09T14:25:11+00:00 |",
+            "|                           |",
+            "+---------------------------+",
+        ];
+        check_datetime_with_timezone!(
+            TimestampSecondArray,
+            11111111,
+            "UTC".to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    #[cfg(features = "chrono-tz")]
+    fn test_pretty_format_timestamp_second_with_non_utc_timezone() {
+        let expected = vec![
+            "+---------------------------+",
+            "| f                         |",
+            "+---------------------------+",
+            "| 1970-05-09T22:25:11+08:00 |",
+            "|                           |",
+            "+---------------------------+",
+        ];
+        check_datetime_with_timezone!(
+            TimestampSecondArray,
+            11111111,
+            "Asia/Taipei".to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_pretty_format_timestamp_second_with_fixed_offset_timezone() {
+        let expected = vec![
+            "+---------------------------+",
+            "| f                         |",
+            "+---------------------------+",
+            "| 1970-05-09T22:25:11+08:00 |",
+            "|                           |",
+            "+---------------------------+",
+        ];
+        check_datetime_with_timezone!(
+            TimestampSecondArray,
+            11111111,
+            "+08:00".to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_pretty_format_timestamp_second_with_incorrect_fixed_offset_timezone() {
+        let expected = vec![
+            "+-------------------------------------------------+",
+            "| f                                               |",
+            "+-------------------------------------------------+",
+            "| 1970-05-09T14:25:11 (Unknown Time Zone '08:00') |",
+            "|                                                 |",
+            "+-------------------------------------------------+",
+        ];
+        check_datetime_with_timezone!(
+            TimestampSecondArray,
+            11111111,
+            "08:00".to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_pretty_format_timestamp_second_with_unknown_timezone() {
+        let expected = vec![
+            "+---------------------------------------------------+",
+            "| f                                                 |",
+            "+---------------------------------------------------+",
+            "| 1970-05-09T14:25:11 (Unknown Time Zone 'Unknown') |",
+            "|                                                   |",
+            "+---------------------------------------------------+",
+        ];
+        check_datetime_with_timezone!(
+            TimestampSecondArray,
+            11111111,
+            "Unknown".to_string(),
+            expected
+        );
+    }
+
     #[test]
     fn test_pretty_format_timestamp_second() {
         let expected = vec![
             "+---------------------+",
             "| f                   |",
             "+---------------------+",
-            "| 1970-05-09 14:25:11 |",
+            "| 1970-05-09T14:25:11 |",
             "|                     |",
             "+---------------------+",
         ];
@@ -392,7 +510,7 @@ mod tests {
             "+-------------------------+",
             "| f                       |",
             "+-------------------------+",
-            "| 1970-01-01 03:05:11.111 |",
+            "| 1970-01-01T03:05:11.111 |",
             "|                         |",
             "+-------------------------+",
         ];
@@ -405,7 +523,7 @@ mod tests {
             "+----------------------------+",
             "| f                          |",
             "+----------------------------+",
-            "| 1970-01-01 00:00:11.111111 |",
+            "| 1970-01-01T00:00:11.111111 |",
             "|                            |",
             "+----------------------------+",
         ];
@@ -418,7 +536,7 @@ mod tests {
             "+-------------------------------+",
             "| f                             |",
             "+-------------------------------+",
-            "| 1970-01-01 00:00:00.011111111 |",
+            "| 1970-01-01T00:00:00.011111111 |",
             "|                               |",
             "+-------------------------------+",
         ];
@@ -650,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_pretty_format_dense_union() -> Result<()> {
-        let mut builder = UnionBuilder::new_dense(4);
+        let mut builder = UnionBuilder::new_dense();
         builder.append::<Int32Type>("a", 1).unwrap();
         builder.append::<Float64Type>("b", 3.2234).unwrap();
         builder.append_null::<Float64Type>("b").unwrap();
@@ -691,7 +809,7 @@ mod tests {
 
     #[test]
     fn test_pretty_format_sparse_union() -> Result<()> {
-        let mut builder = UnionBuilder::new_sparse(4);
+        let mut builder = UnionBuilder::new_sparse();
         builder.append::<Int32Type>("a", 1).unwrap();
         builder.append::<Float64Type>("b", 3.2234).unwrap();
         builder.append_null::<Float64Type>("b").unwrap();
@@ -733,7 +851,7 @@ mod tests {
     #[test]
     fn test_pretty_format_nested_union() -> Result<()> {
         //Inner UnionArray
-        let mut builder = UnionBuilder::new_dense(5);
+        let mut builder = UnionBuilder::new_dense();
         builder.append::<Int32Type>("b", 1).unwrap();
         builder.append::<Float64Type>("c", 3.2234).unwrap();
         builder.append_null::<Float64Type>("c").unwrap();

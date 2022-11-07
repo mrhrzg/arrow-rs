@@ -18,10 +18,38 @@
 //! A complete, safe, native Rust implementation of [Apache Arrow](https://arrow.apache.org), a cross-language
 //! development platform for in-memory data.
 //!
+//! Please see the [arrow crates.io](https://crates.io/crates/arrow)
+//! page for feature flags and tips to improve performance.
+//!
+//! # Crate Topology
+//!
+//! The [`arrow`] project is implemented as multiple sub-crates, which are then re-exported by
+//! this top-level crate.
+//!
+//! Crate authors can choose to depend on this top-level crate, or just
+//! the sub-crates they need.
+//!
+//! The current list of sub-crates is:
+//!
+//! * [`arrow-array`][arrow_array] - type-safe arrow array abstractions
+//! * [`arrow-buffer`][arrow_buffer] - buffer abstractions for arrow arrays
+//! * [`arrow-cast`][arrow_cast] - cast kernels for arrow arrays
+//! * [`arrow-data`][arrow_data] - the underlying data of arrow arrays
+//! * [`arrow-schema`][arrow_schema] - the logical types for arrow arrays
+//! * [`arrow-select`][arrow_select] - selection kernels for arrow arrays
+//!
+//! _This list is likely to grow as further functionality is split out from the top-level crate_
+//!
+//! Some functionality is also distributed independently of this crate:
+//!
+//! * [`arrow-flight`] - support for [Arrow Flight RPC]
+//! * [`arrow-integration-test`] - support for [Arrow JSON Test Format]
+//! * [`parquet`](https://docs.rs/parquet/latest/parquet/) - support for [Apache Parquet]
+//!
 //! # Columnar Format
 //!
-//! The [`array`] module provides statically typed implementations of all the array
-//! types as defined by the [Arrow Columnar Format](https://arrow.apache.org/docs/format/Columnar.html).
+//! The [`array`] module provides statically typed implementations of all the array types as defined
+//! by the [Arrow Columnar Format](https://arrow.apache.org/docs/format/Columnar.html)
 //!
 //! For example, an [`Int32Array`](array::Int32Array) represents a nullable array of `i32`
 //!
@@ -57,7 +85,24 @@
 //! assert_eq!(sum(&TimestampNanosecondArray::from(vec![1, 2, 3])), 6);
 //! ```
 //!
-//! For more examples, consult the [`array`] docs.
+//! And the following is generic over all arrays with comparable values
+//!
+//! ```rust
+//! # use arrow::array::{ArrayAccessor, ArrayIter, Int32Array, StringArray};
+//! # use arrow::datatypes::ArrowPrimitiveType;
+//! #
+//! fn min<T: ArrayAccessor>(array: T) -> Option<T::Item>
+//! where
+//!     T::Item: Ord
+//! {
+//!     ArrayIter::new(array).filter_map(|v| v).min()
+//! }
+//!
+//! assert_eq!(min(&Int32Array::from(vec![4, 2, 1, 6])), Some(1));
+//! assert_eq!(min(&StringArray::from(vec!["b", "a", "c"])), Some("a"));
+//! ```
+//!
+//! For more examples, consult the [arrow_array] docs.
 //!
 //! # Type Erasure / Trait Objects
 //!
@@ -97,6 +142,7 @@
 //! fn parse_to_primitive<'a, T, I>(iter: I) -> PrimitiveArray<T>
 //! where
 //!     T: ArrowPrimitiveType,
+//!     T::Native: FromStr,
 //!     I: IntoIterator<Item=&'a str>,
 //! {
 //!     PrimitiveArray::from_iter(iter.into_iter().map(|val| T::Native::from_str(val).ok()))
@@ -151,6 +197,20 @@
 //! * [`take`](compute::kernels::take::take) and [`limit`](compute::kernels::limit::limit)
 //! * [`sort`](compute::kernels::sort::sort)
 //! * some string operators such as [`substring`](compute::kernels::substring::substring) and [`length`](compute::kernels::length::length)
+//!
+//! ```
+//! # use arrow::compute::gt_scalar;
+//! # use arrow_array::cast::as_primitive_array;
+//! # use arrow_array::Int32Array;
+//! # use arrow_array::types::Int32Type;
+//! # use arrow_select::filter::filter;
+//! let array = Int32Array::from_iter(0..100);
+//! let predicate = gt_scalar(&array, 60).unwrap();
+//! let filtered = filter(&array, &predicate).unwrap();
+//!
+//! let expected = Int32Array::from_iter(61..100);
+//! assert_eq!(&expected, as_primitive_array::<Int32Type>(&filtered));
+//! ```
 //!
 //! As well as some horizontal operations, such as:
 //!
@@ -214,6 +274,7 @@
 //! orchestrates the primitives exported by this crate into an embeddable query engine, with
 //! SQL and DataFrame frontends, and heavily influences this crate's roadmap.
 //!
+//! [`arrow`]: https://github.com/apache/arrow-rs
 //! [`array`]: mod@array
 //! [`Array`]: array::Array
 //! [`ArrayRef`]: array::ArrayRef
@@ -221,31 +282,48 @@
 //! [`make_array`]: array::make_array
 //! [`Buffer`]: buffer::Buffer
 //! [`RecordBatch`]: record_batch::RecordBatch
+//! [`arrow-flight`]: https://docs.rs/arrow-flight/latest/arrow_flight/
+//! [`arrow-integration-test`]: https://docs.rs/arrow-integration-test/latest/arrow_integration_test/
+//! [`parquet`]: https://docs.rs/parquet/latest/parquet/
+//! [Arrow Flight RPC]: https://arrow.apache.org/docs/format/Flight.html
+//! [Arrow JSON Test Format]: https://github.com/apache/arrow/blob/master/docs/source/format/Integration.rst#json-test-data-format
+//! [Apache Parquet]: https://parquet.apache.org/
 //! [DataFusion]: https://github.com/apache/arrow-datafusion
 //! [issue tracker]: https://github.com/apache/arrow-rs/issues
 //!
 
 #![deny(clippy::redundant_clone)]
 #![warn(missing_debug_implementations)]
+#![allow(rustdoc::invalid_html_tags)]
+pub use arrow_array::{downcast_dictionary_array, downcast_primitive_array};
 
-pub mod alloc;
+pub use arrow_buffer::{alloc, buffer};
+
+pub mod bitmap {
+    pub use arrow_data::Bitmap;
+}
+
 pub mod array;
-pub mod bitmap;
-pub mod buffer;
-mod bytes;
 pub mod compute;
 #[cfg(feature = "csv")]
 pub mod csv;
 pub mod datatypes;
 pub mod error;
+#[cfg(feature = "ffi")]
 pub mod ffi;
+#[cfg(feature = "ffi")]
 pub mod ffi_stream;
 #[cfg(feature = "ipc")]
-pub mod ipc;
+pub use arrow_ipc as ipc;
+#[cfg(feature = "serde_json")]
 pub mod json;
 #[cfg(feature = "pyarrow")]
 pub mod pyarrow;
-pub mod record_batch;
-pub mod temporal_conversions;
+
+pub mod record_batch {
+    pub use arrow_array::{RecordBatch, RecordBatchOptions, RecordBatchReader};
+}
+pub mod row;
+pub use arrow_array::temporal_conversions;
 pub mod tensor;
 pub mod util;

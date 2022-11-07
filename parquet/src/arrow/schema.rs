@@ -41,7 +41,7 @@ mod complex;
 mod primitive;
 
 use crate::arrow::ProjectionMask;
-pub(crate) use complex::{convert_schema, ParquetField, ParquetFieldType};
+pub(crate) use complex::{ParquetField, ParquetFieldType};
 
 /// Convert Parquet schema to Arrow schema including optional metadata.
 /// Attempts to decode any existing Arrow schema metadata, falling back
@@ -64,6 +64,15 @@ pub fn parquet_to_arrow_schema_by_columns(
     mask: ProjectionMask,
     key_value_metadata: Option<&Vec<KeyValue>>,
 ) -> Result<Schema> {
+    Ok(parquet_to_array_schema_and_fields(parquet_schema, mask, key_value_metadata)?.0)
+}
+
+/// Extracts the arrow metadata
+pub(crate) fn parquet_to_array_schema_and_fields(
+    parquet_schema: &SchemaDescriptor,
+    mask: ProjectionMask,
+    key_value_metadata: Option<&Vec<KeyValue>>,
+) -> Result<(Schema, Option<ParquetField>)> {
     let mut metadata = parse_key_value_metadata(key_value_metadata).unwrap_or_default();
     let maybe_schema = metadata
         .remove(super::ARROW_SCHEMA_META_KEY)
@@ -73,16 +82,19 @@ pub fn parquet_to_arrow_schema_by_columns(
     // Add the Arrow metadata to the Parquet metadata skipping keys that collide
     if let Some(arrow_schema) = &maybe_schema {
         arrow_schema.metadata().iter().for_each(|(k, v)| {
-            metadata.entry(k.clone()).or_insert(v.clone());
+            metadata.entry(k.clone()).or_insert_with(|| v.clone());
         });
     }
 
-    match convert_schema(parquet_schema, mask, maybe_schema.as_ref())? {
-        Some(field) => match field.arrow_type {
-            DataType::Struct(fields) => Ok(Schema::new_with_metadata(fields, metadata)),
+    match complex::convert_schema(parquet_schema, mask, maybe_schema.as_ref())? {
+        Some(field) => match &field.arrow_type {
+            DataType::Struct(fields) => Ok((
+                Schema::new_with_metadata(fields.clone(), metadata),
+                Some(field),
+            )),
             _ => unreachable!(),
         },
-        None => Ok(Schema::new_with_metadata(vec![], metadata)),
+        None => Ok((Schema::new_with_metadata(vec![], metadata), None)),
     }
 }
 
@@ -100,7 +112,7 @@ fn get_arrow_schema_from_metadata(encoded_meta: &str) -> Result<Schema> {
                 Ok(message) => message
                     .header_as_schema()
                     .map(arrow::ipc::convert::fb_to_schema)
-                    .ok_or(arrow_err!("the message is not Arrow Schema")),
+                    .ok_or_else(|| arrow_err!("the message is not Arrow Schema")),
                 Err(err) => {
                     // The flatbuffers implementation returns an error on verification error.
                     Err(arrow_err!(
@@ -220,7 +232,7 @@ pub fn parquet_to_arrow_field(parquet_column: &ColumnDescriptor) -> Result<Field
     ))
 }
 
-pub fn decimal_length_from_precision(precision: usize) -> usize {
+pub fn decimal_length_from_precision(precision: u8) -> usize {
     (10.0_f64.powi(precision as i32).log2() / 8.0).ceil() as usize
 }
 
@@ -488,7 +500,7 @@ mod tests {
 
     use crate::file::metadata::KeyValue;
     use crate::{
-        arrow::{ArrowReader, ArrowWriter, ParquetFileArrowReader},
+        arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter},
         schema::{parser::parse_message_type, types::SchemaDescriptor},
     };
 
@@ -1233,6 +1245,9 @@ mod tests {
             OPTIONAL INT64   ts_milli (TIMESTAMP_MILLIS);
             REQUIRED INT64   ts_micro (TIMESTAMP_MICROS);
             REQUIRED INT64   ts_nano (TIMESTAMP(NANOS,true));
+            REPEATED INT32   int_list;
+            REPEATED BINARY  byte_list;
+            REPEATED BINARY  string_list (UTF8);
         }
         ";
         let parquet_group_type = parse_message_type(message_type).unwrap();
@@ -1277,6 +1292,29 @@ mod tests {
             Field::new(
                 "ts_nano",
                 DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".to_string())),
+                false,
+            ),
+            Field::new(
+                "int_list",
+                DataType::List(Box::new(Field::new("int_list", DataType::Int32, false))),
+                false,
+            ),
+            Field::new(
+                "byte_list",
+                DataType::List(Box::new(Field::new(
+                    "byte_list",
+                    DataType::Binary,
+                    false,
+                ))),
+                false,
+            ),
+            Field::new(
+                "string_list",
+                DataType::List(Box::new(Field::new(
+                    "string_list",
+                    DataType::Utf8,
+                    false,
+                ))),
                 false,
             ),
         ];
@@ -1662,14 +1700,9 @@ mod tests {
         writer.close()?;
 
         // read file back
-        let mut arrow_reader = ParquetFileArrowReader::try_new(file).unwrap();
-        let read_schema = arrow_reader.get_schema()?;
-        assert_eq!(schema, read_schema);
-
-        // read all fields by columns
-        let partial_read_schema =
-            arrow_reader.get_schema_by_columns(ProjectionMask::all())?;
-        assert_eq!(schema, partial_read_schema);
+        let arrow_reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let read_schema = arrow_reader.schema();
+        assert_eq!(&schema, read_schema.as_ref());
 
         Ok(())
     }
@@ -1731,15 +1764,9 @@ mod tests {
         writer.close()?;
 
         // read file back
-        let mut arrow_reader = ParquetFileArrowReader::try_new(file).unwrap();
-        let read_schema = arrow_reader.get_schema()?;
-        assert_eq!(schema, read_schema);
-
-        // read all fields by columns
-        let partial_read_schema =
-            arrow_reader.get_schema_by_columns(ProjectionMask::all())?;
-        assert_eq!(schema, partial_read_schema);
-
+        let arrow_reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let read_schema = arrow_reader.schema();
+        assert_eq!(&schema, read_schema.as_ref());
         Ok(())
     }
 }

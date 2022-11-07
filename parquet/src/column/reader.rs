@@ -28,7 +28,7 @@ use crate::column::reader::decoder::{
 use crate::data_type::*;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
-use crate::util::bit_util::{ceil, num_required_bits};
+use crate::util::bit_util::{ceil, num_required_bits, read_num_bytes};
 use crate::util::memory::ByteBufferPtr;
 
 pub(crate) mod decoder;
@@ -306,13 +306,13 @@ where
 
                 // If dictionary, we must read it
                 if metadata.is_dict {
-                    self.read_new_page()?;
+                    self.read_dictionary_page()?;
                     continue;
                 }
 
                 // If page has less rows than the remaining records to
                 // be skipped, skip entire page
-                if metadata.num_rows < remaining {
+                if metadata.num_rows <= remaining {
                     self.page_reader.skip_next_page()?;
                     remaining -= metadata.num_rows;
                     continue;
@@ -360,6 +360,24 @@ where
             remaining -= records_read;
         }
         Ok(num_records - remaining)
+    }
+
+    /// Read the next page as a dictionary page. If the next page is not a dictionary page,
+    /// this will return an error.
+    fn read_dictionary_page(&mut self) -> Result<()> {
+        match self.page_reader.get_next_page()? {
+            Some(Page::DictionaryPage {
+                buf,
+                num_values,
+                encoding,
+                is_sorted,
+            }) => self
+                .values_decoder
+                .set_dict(buf, num_values, encoding, is_sorted),
+            _ => Err(ParquetError::General(
+                "Invalid page. Expecting dictionary page".to_string(),
+            )),
+        }
     }
 
     /// Reads a new page and set up the decoders for levels, values or dictionary.
@@ -493,6 +511,28 @@ where
         }
     }
 
+    /// Check whether there is more data to read from this column,
+    /// If the current page is fully decoded, this will NOT load the next page
+    /// into the buffer
+    #[inline]
+    pub(crate) fn peek_next(&mut self) -> Result<bool> {
+        if self.num_buffered_values == 0
+            || self.num_buffered_values == self.num_decoded_values
+        {
+            // TODO: should we return false if read_new_page() = true and
+            // num_buffered_values = 0?
+            match self.page_reader.peek_next_page()? {
+                Some(next_page) => Ok(next_page.num_rows != 0),
+                None => Ok(false),
+            }
+        } else {
+            Ok(true)
+        }
+    }
+
+    /// Check whether there is more data to read from this column,
+    /// If the current page is fully decoded, this will load the next page
+    /// (if it exists) into the buffer
     #[inline]
     pub(crate) fn has_next(&mut self) -> Result<bool> {
         if self.num_buffered_values == 0
@@ -520,7 +560,7 @@ fn parse_v1_level(
     match encoding {
         Encoding::RLE => {
             let i32_size = std::mem::size_of::<i32>();
-            let data_size = read_num_bytes!(i32, i32_size, buf.as_ref()) as usize;
+            let data_size = read_num_bytes::<i32>(i32_size, buf.as_ref()) as usize;
             Ok((i32_size + data_size, buf.range(i32_size, data_size)))
         }
         Encoding::BIT_PACKED => {
@@ -544,8 +584,8 @@ mod tests {
 
     use crate::basic::Type as PhysicalType;
     use crate::schema::types::{ColumnDescriptor, ColumnPath, Type as SchemaType};
-    use crate::util::test_common::make_pages;
     use crate::util::test_common::page_util::InMemoryPageReader;
+    use crate::util::test_common::rand_gen::make_pages;
 
     const NUM_LEVELS: usize = 128;
     const NUM_PAGES: usize = 2;
@@ -1231,6 +1271,7 @@ mod tests {
 
         // Helper function for the general case of `read_batch()` where `values`,
         // `def_levels` and `rep_levels` are always provided with enough space.
+        #[allow(clippy::too_many_arguments)]
         fn test_read_batch_general(
             &mut self,
             desc: ColumnDescPtr,
@@ -1262,6 +1303,7 @@ mod tests {
 
         // Helper function to test `read_batch()` method with custom buffers for values,
         // definition and repetition levels.
+        #[allow(clippy::too_many_arguments)]
         fn test_read_batch(
             &mut self,
             desc: ColumnDescPtr,

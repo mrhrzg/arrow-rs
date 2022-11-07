@@ -168,7 +168,6 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
 
         // Set either main encoder or fallback encoder.
         let encoder = get_encoder(
-            descr.clone(),
             props
                 .encoding(descr.path())
                 .unwrap_or_else(|| fallback_encoding(T::get_physical_type(), props)),
@@ -202,6 +201,7 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
     }
 
     fn write_gather(&mut self, values: &Self::Values, indices: &[usize]) -> Result<()> {
+        self.num_values += indices.len();
         let slice: Vec<_> = indices.iter().map(|idx| values[*idx].clone()).collect();
         self.write_slice(&slice)
     }

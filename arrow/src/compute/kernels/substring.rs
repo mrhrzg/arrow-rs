@@ -205,7 +205,7 @@ pub fn substring_by_char<OffsetSize: OffsetSizeTrait>(
     });
     let data = unsafe {
         ArrayData::new_unchecked(
-            GenericStringArray::<OffsetSize>::get_data_type(),
+            GenericStringArray::<OffsetSize>::DATA_TYPE,
             array.len(),
             None,
             array
@@ -280,21 +280,20 @@ fn binary_substring<OffsetSize: OffsetSizeTrait>(
     });
 
     // concatenate substrings into a buffer
-    let mut new_values =
-        MutableBuffer::new(new_offsets.last().unwrap().to_usize().unwrap());
+    let mut new_values = MutableBuffer::new(new_offsets.last().unwrap().as_usize());
 
     new_starts_ends
         .iter()
         .map(|(start, end)| {
-            let start = start.to_usize().unwrap();
-            let end = end.to_usize().unwrap();
+            let start = start.as_usize();
+            let end = end.as_usize();
             &data[start..end]
         })
         .for_each(|slice| new_values.extend_from_slice(slice));
 
     let data = unsafe {
         ArrayData::new_unchecked(
-            GenericBinaryArray::<OffsetSize>::get_data_type(),
+            GenericBinaryArray::<OffsetSize>::DATA_TYPE,
             array.len(),
             None,
             array
@@ -375,7 +374,7 @@ fn utf8_substring<OffsetSize: OffsetSizeTrait>(
         // Safety: a StringArray must contain valid UTF8 data
         let data_str = unsafe { std::str::from_utf8_unchecked(data) };
         |offset: OffsetSize| {
-            let offset_usize = offset.to_usize().unwrap();
+            let offset_usize = offset.as_usize();
             if data_str.is_char_boundary(offset_usize) {
                 Ok(offset)
             } else {
@@ -411,21 +410,20 @@ fn utf8_substring<OffsetSize: OffsetSizeTrait>(
     })?;
 
     // concatenate substrings into a buffer
-    let mut new_values =
-        MutableBuffer::new(new_offsets.last().unwrap().to_usize().unwrap());
+    let mut new_values = MutableBuffer::new(new_offsets.last().unwrap().as_usize());
 
     new_starts_ends
         .iter()
         .map(|(start, end)| {
-            let start = start.to_usize().unwrap();
-            let end = end.to_usize().unwrap();
+            let start = start.as_usize();
+            let end = end.as_usize();
             &data[start..end]
         })
         .for_each(|slice| new_values.extend_from_slice(slice));
 
     let data = unsafe {
         ArrayData::new_unchecked(
-            GenericStringArray::<OffsetSize>::get_data_type(),
+            GenericStringArray::<OffsetSize>::DATA_TYPE,
             array.len(),
             None,
             array
@@ -587,7 +585,7 @@ mod tests {
         // set the first and third element to be valid
         let bitmap = [0b101_u8];
 
-        let data = ArrayData::builder(GenericBinaryArray::<O>::get_data_type())
+        let data = ArrayData::builder(GenericBinaryArray::<O>::DATA_TYPE)
             .len(2)
             .add_buffer(Buffer::from_slice_ref(offsets))
             .add_buffer(Buffer::from_iter(values))
@@ -814,7 +812,7 @@ mod tests {
         // set the first and third element to be valid
         let bitmap = [0b101_u8];
 
-        let data = ArrayData::builder(GenericStringArray::<O>::get_data_type())
+        let data = ArrayData::builder(GenericStringArray::<O>::DATA_TYPE)
             .len(2)
             .add_buffer(Buffer::from_slice_ref(offsets))
             .add_buffer(Buffer::from(values))
@@ -939,7 +937,7 @@ mod tests {
         // set the first and third element to be valid
         let bitmap = [0b101_u8];
 
-        let data = ArrayData::builder(GenericStringArray::<O>::get_data_type())
+        let data = ArrayData::builder(GenericStringArray::<O>::DATA_TYPE)
             .len(2)
             .add_buffer(Buffer::from_slice_ref(offsets))
             .add_buffer(Buffer::from(values))

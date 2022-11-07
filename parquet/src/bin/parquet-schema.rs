@@ -57,7 +57,7 @@ fn main() {
     let args = Args::parse();
     let filename = args.file_path;
     let path = Path::new(&filename);
-    let file = File::open(&path).expect("Unable to open file");
+    let file = File::open(path).expect("Unable to open file");
     let verbose = args.verbose;
 
     match SerializedFileReader::new(file) {
@@ -67,9 +67,9 @@ fn main() {
             println!("Metadata for file: {}", &filename);
             println!();
             if verbose {
-                print_parquet_metadata(&mut std::io::stdout(), &metadata);
+                print_parquet_metadata(&mut std::io::stdout(), metadata);
             } else {
-                print_file_metadata(&mut std::io::stdout(), &metadata.file_metadata());
+                print_file_metadata(&mut std::io::stdout(), metadata.file_metadata());
             }
         }
     }

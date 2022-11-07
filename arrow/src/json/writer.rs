@@ -111,11 +111,14 @@ use serde_json::Value;
 use crate::array::*;
 use crate::datatypes::*;
 use crate::error::{ArrowError, Result};
+use crate::json::JsonSerializable;
 use crate::record_batch::RecordBatch;
 
-fn primitive_array_to_json<T: ArrowPrimitiveType>(
-    array: &ArrayRef,
-) -> Result<Vec<Value>> {
+fn primitive_array_to_json<T>(array: &ArrayRef) -> Result<Vec<Value>>
+where
+    T: ArrowPrimitiveType,
+    T::Native: JsonSerializable,
+{
     Ok(as_primitive_array::<T>(array)
         .iter()
         .map(|maybe_value| match maybe_value {
@@ -239,12 +242,15 @@ macro_rules! set_temporal_column_by_array_type {
     };
 }
 
-fn set_column_by_primitive_type<T: ArrowPrimitiveType>(
+fn set_column_by_primitive_type<T>(
     rows: &mut [JsonMap<String, Value>],
     row_count: usize,
     array: &ArrayRef,
     col_name: &str,
-) {
+) where
+    T: ArrowPrimitiveType,
+    T::Native: JsonSerializable,
+{
     let primitive_arr = as_primitive_array::<T>(array);
 
     rows.iter_mut()
@@ -694,7 +700,10 @@ where
         }
 
         self.format.start_row(&mut self.writer, is_first_row)?;
-        self.writer.write_all(&serde_json::to_vec(row)?)?;
+        self.writer.write_all(
+            &serde_json::to_vec(row)
+                .map_err(|error| ArrowError::JsonError(error.to_string()))?,
+        )?;
         self.format.end_row(&mut self.writer)?;
         Ok(())
     }
@@ -883,14 +892,10 @@ mod tests {
         let ts_millis = ts_micros / 1000;
         let ts_secs = ts_millis / 1000;
 
-        let arr_nanos =
-            TimestampNanosecondArray::from_opt_vec(vec![Some(ts_nanos), None], None);
-        let arr_micros =
-            TimestampMicrosecondArray::from_opt_vec(vec![Some(ts_micros), None], None);
-        let arr_millis =
-            TimestampMillisecondArray::from_opt_vec(vec![Some(ts_millis), None], None);
-        let arr_secs =
-            TimestampSecondArray::from_opt_vec(vec![Some(ts_secs), None], None);
+        let arr_nanos = TimestampNanosecondArray::from(vec![Some(ts_nanos), None]);
+        let arr_micros = TimestampMicrosecondArray::from(vec![Some(ts_micros), None]);
+        let arr_millis = TimestampMillisecondArray::from(vec![Some(ts_millis), None]);
+        let arr_secs = TimestampSecondArray::from(vec![Some(ts_secs), None]);
         let arr_names = StringArray::from(vec![Some("a"), Some("b")]);
 
         let schema = Schema::new(vec![

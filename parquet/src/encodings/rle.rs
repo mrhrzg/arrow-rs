@@ -27,25 +27,23 @@ use crate::util::{
 /// The grammar for this encoding looks like the following (copied verbatim
 /// from <https://github.com/Parquet/parquet-format/blob/master/Encodings.md>):
 ///
-/// rle-bit-packed-hybrid: <length> <encoded-data>
-/// length := length of the <encoded-data> in bytes stored as 4 bytes little endian
-/// encoded-data := <run>*
-/// run := <bit-packed-run> | <rle-run>
-/// bit-packed-run := <bit-packed-header> <bit-packed-values>
-/// bit-packed-header := varint-encode(<bit-pack-count> << 1 | 1)
+/// rle-bit-packed-hybrid: `<length>` `<encoded-data>`
+/// length := length of the `<encoded-data>` in bytes stored as 4 bytes little endian
+/// encoded-data := `<run>`*
+/// run := `<bit-packed-run>` | `<rle-run>`
+/// bit-packed-run := `<bit-packed-header>` `<bit-packed-values>`
+/// bit-packed-header := varint-encode(`<bit-pack-count>` << 1 | 1)
 /// we always bit-pack a multiple of 8 values at a time, so we only store the number of
 /// values / 8
 /// bit-pack-count := (number of values in this run) / 8
 /// bit-packed-values := *see 1 below*
-/// rle-run := <rle-header> <repeated-value>
+/// rle-run := `<rle-header>` `<repeated-value>`
 /// rle-header := varint-encode( (number of times repeated) << 1)
 /// repeated-value := value that is repeated, using a fixed-width of
 /// round-up-to-next-byte(bit-width)
 
-/// Maximum groups per bit-packed run. Current value is 64.
+/// Maximum groups of 8 values per bit-packed run. Current value is 64.
 const MAX_GROUPS_PER_BIT_PACKED_RUN: usize = 1 << 6;
-const MAX_VALUES_PER_BIT_PACKED_RUN: usize = MAX_GROUPS_PER_BIT_PACKED_RUN * 8;
-const MAX_WRITER_BUF_SIZE: usize = 1 << 10;
 
 /// A RLE/Bit-Packing hybrid encoder.
 // TODO: tracking memory usage
@@ -55,9 +53,6 @@ pub struct RleEncoder {
 
     // Underlying writer which holds an internal buffer.
     bit_writer: BitWriter,
-
-    // The maximum byte size a single run can take.
-    max_run_byte_size: usize,
 
     // Buffered values for bit-packed runs.
     buffered_values: [u64; 8],
@@ -82,6 +77,7 @@ pub struct RleEncoder {
 }
 
 impl RleEncoder {
+    #[allow(unused)]
     pub fn new(bit_width: u8, buffer_len: usize) -> Self {
         let buffer = Vec::with_capacity(buffer_len);
         RleEncoder::new_from_buf(bit_width, buffer)
@@ -89,12 +85,10 @@ impl RleEncoder {
 
     /// Initialize the encoder from existing `buffer`
     pub fn new_from_buf(bit_width: u8, buffer: Vec<u8>) -> Self {
-        let max_run_byte_size = RleEncoder::min_buffer_size(bit_width);
         let bit_writer = BitWriter::new_from_buf(buffer);
         RleEncoder {
             bit_width,
             bit_writer,
-            max_run_byte_size,
             buffered_values: [0; 8],
             num_buffered_values: 0,
             current_value: 0,
@@ -104,31 +98,28 @@ impl RleEncoder {
         }
     }
 
-    /// Returns the minimum buffer size needed to use the encoder for `bit_width`.
-    /// This is the maximum length of a single run for `bit_width`.
-    pub fn min_buffer_size(bit_width: u8) -> usize {
-        let max_bit_packed_run_size = 1 + bit_util::ceil(
-            (MAX_VALUES_PER_BIT_PACKED_RUN * bit_width as usize) as i64,
-            8,
-        );
-        let max_rle_run_size =
-            bit_util::MAX_VLQ_BYTE_LEN + bit_util::ceil(bit_width as i64, 8) as usize;
-        std::cmp::max(max_bit_packed_run_size as usize, max_rle_run_size)
-    }
-
-    /// Returns the maximum buffer size takes to encode `num_values` values with
+    /// Returns the maximum buffer size to encode `num_values` values with
     /// `bit_width`.
     pub fn max_buffer_size(bit_width: u8, num_values: usize) -> usize {
-        // First the maximum size for bit-packed run
-        let bytes_per_run = bit_width;
-        let num_runs = bit_util::ceil(num_values as i64, 8) as usize;
-        let bit_packed_max_size = num_runs + num_runs * bytes_per_run as usize;
+        // The maximum size occurs with the shortest possible runs of 8
+        let num_runs = bit_util::ceil(num_values, 8);
 
-        // Second the maximum size for RLE run
-        let min_rle_run_size = 1 + bit_util::ceil(bit_width as i64, 8) as usize;
-        let rle_max_size =
-            bit_util::ceil(num_values as i64, 8) as usize * min_rle_run_size;
-        std::cmp::max(bit_packed_max_size, rle_max_size) as usize
+        // The number of bytes in a run of 8
+        let bytes_per_run = bit_width as usize;
+
+        // The maximum size if stored as shortest possible bit packed runs of 8
+        let bit_packed_max_size = num_runs + num_runs * bytes_per_run;
+
+        // The length of `8` VLQ encoded
+        let rle_len_prefix = 1;
+
+        // The length of an RLE run of 8
+        let min_rle_run_size = rle_len_prefix + bit_util::ceil(bit_width as usize, 8);
+
+        // The maximum size if stored as shortest possible RLE runs of 8
+        let rle_max_size = num_runs * min_rle_run_size;
+
+        bit_packed_max_size.max(rle_max_size)
     }
 
     /// Encodes `value`, which must be representable with `bit_width` bits.
@@ -162,6 +153,7 @@ impl RleEncoder {
     }
 
     #[inline]
+    #[allow(unused)]
     pub fn buffer(&self) -> &[u8] {
         self.bit_writer.buffer()
     }
@@ -171,6 +163,7 @@ impl RleEncoder {
         self.bit_writer.bytes_written()
     }
 
+    #[allow(unused)]
     pub fn is_empty(&self) -> bool {
         self.bit_writer.bytes_written() == 0
     }
@@ -184,6 +177,7 @@ impl RleEncoder {
     /// Borrow equivalent of the `consume` method.
     /// Call `clear()` after invoking this method.
     #[inline]
+    #[allow(unused)]
     pub fn flush_buffer(&mut self) -> &[u8] {
         self.flush();
         self.bit_writer.flush_buffer()
@@ -192,6 +186,7 @@ impl RleEncoder {
     /// Clears the internal state so this encoder can be reused (e.g., after becoming
     /// full).
     #[inline]
+    #[allow(unused)]
     pub fn clear(&mut self) {
         self.bit_writer.clear();
         self.num_buffered_values = 0;
@@ -343,6 +338,7 @@ impl RleDecoder {
     // These functions inline badly, they tend to inline and then create very large loop unrolls
     // that damage L1d-cache occupancy. This results in a ~18% performance drop
     #[inline(never)]
+    #[allow(unused)]
     pub fn get<T: FromBytes>(&mut self) -> Result<Option<T>> {
         assert!(size_of::<T>() <= 8);
 
@@ -906,8 +902,8 @@ mod tests {
     #[test]
     fn test_rle_specific_roundtrip() {
         let bit_width = 1;
-        let buffer_len = RleEncoder::min_buffer_size(bit_width);
         let values: Vec<i16> = vec![0, 1, 1, 1, 1, 0, 0, 0, 0, 1];
+        let buffer_len = RleEncoder::max_buffer_size(bit_width, values.len());
         let mut encoder = RleEncoder::new(bit_width, buffer_len);
         for v in &values {
             encoder.put(*v as u64)

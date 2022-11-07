@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::arrow::arrow_writer::levels::LevelInfo;
-use crate::arrow::arrow_writer::ArrayWriter;
 use crate::basic::Encoding;
 use crate::column::page::PageWriter;
 use crate::column::writer::encoder::{
@@ -33,10 +32,37 @@ use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::num_required_bits;
 use crate::util::interner::{Interner, Storage};
 use arrow::array::{
-    Array, ArrayAccessor, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray,
-    StringArray,
+    Array, ArrayAccessor, ArrayRef, BinaryArray, DictionaryArray, LargeBinaryArray,
+    LargeStringArray, StringArray,
 };
 use arrow::datatypes::DataType;
+
+macro_rules! downcast_dict_impl {
+    ($array:ident, $key:ident, $val:ident, $op:expr $(, $arg:expr)*) => {{
+        $op($array
+            .as_any()
+            .downcast_ref::<DictionaryArray<arrow::datatypes::$key>>()
+            .unwrap()
+            .downcast_dict::<$val>()
+            .unwrap()$(, $arg)*)
+    }};
+}
+
+macro_rules! downcast_dict_op {
+    ($key_type:expr, $val:ident, $array:ident, $op:expr $(, $arg:expr)*) => {
+        match $key_type.as_ref() {
+            DataType::UInt8 => downcast_dict_impl!($array, UInt8Type, $val, $op$(, $arg)*),
+            DataType::UInt16 => downcast_dict_impl!($array, UInt16Type, $val, $op$(, $arg)*),
+            DataType::UInt32 => downcast_dict_impl!($array, UInt32Type, $val, $op$(, $arg)*),
+            DataType::UInt64 => downcast_dict_impl!($array, UInt64Type, $val, $op$(, $arg)*),
+            DataType::Int8 => downcast_dict_impl!($array, Int8Type, $val, $op$(, $arg)*),
+            DataType::Int16 => downcast_dict_impl!($array, Int16Type, $val, $op$(, $arg)*),
+            DataType::Int32 => downcast_dict_impl!($array, Int32Type, $val, $op$(, $arg)*),
+            DataType::Int64 => downcast_dict_impl!($array, Int64Type, $val, $op$(, $arg)*),
+            _ => unreachable!(),
+        }
+    };
+}
 
 macro_rules! downcast_op {
     ($data_type:expr, $array:ident, $op:expr $(, $arg:expr)*) => {
@@ -51,36 +77,44 @@ macro_rules! downcast_op {
             DataType::LargeBinary => {
                 $op($array.as_any().downcast_ref::<LargeBinaryArray>().unwrap()$(, $arg)*)
             }
-            d => unreachable!("cannot downcast {} to byte array", d)
+            DataType::Dictionary(key, value) => match value.as_ref() {
+                DataType::Utf8 => downcast_dict_op!(key, StringArray, $array, $op$(, $arg)*),
+                DataType::LargeUtf8 => {
+                    downcast_dict_op!(key, LargeStringArray, $array, $op$(, $arg)*)
+                }
+                DataType::Binary => downcast_dict_op!(key, BinaryArray, $array, $op$(, $arg)*),
+                DataType::LargeBinary => {
+                    downcast_dict_op!(key, LargeBinaryArray, $array, $op$(, $arg)*)
+                }
+                d => unreachable!("cannot downcast {} dictionary value to byte array", d),
+            },
+            d => unreachable!("cannot downcast {} to byte array", d),
         }
     };
 }
 
-/// Returns an [`ArrayWriter`] for byte or string arrays
-pub(super) fn make_byte_array_writer<'a>(
-    descr: ColumnDescPtr,
-    data_type: DataType,
-    props: WriterPropertiesPtr,
-    page_writer: Box<dyn PageWriter + 'a>,
-    on_close: OnCloseColumnChunk<'a>,
-) -> Box<dyn ArrayWriter + 'a> {
-    Box::new(ByteArrayWriter {
-        writer: Some(GenericColumnWriter::new(descr, props, page_writer)),
-        on_close: Some(on_close),
-        data_type,
-    })
-}
-
-/// An [`ArrayWriter`] for [`ByteArray`]
-struct ByteArrayWriter<'a> {
-    writer: Option<GenericColumnWriter<'a, ByteArrayEncoder>>,
+/// A writer for byte array types
+pub(super) struct ByteArrayWriter<'a> {
+    writer: GenericColumnWriter<'a, ByteArrayEncoder>,
     on_close: Option<OnCloseColumnChunk<'a>>,
-    data_type: DataType,
 }
 
-impl<'a> ArrayWriter for ByteArrayWriter<'a> {
-    fn write(&mut self, array: &ArrayRef, levels: LevelInfo) -> Result<()> {
-        self.writer.as_mut().unwrap().write_batch_internal(
+impl<'a> ByteArrayWriter<'a> {
+    /// Returns a new [`ByteArrayWriter`]
+    pub fn new(
+        descr: ColumnDescPtr,
+        props: &'a WriterPropertiesPtr,
+        page_writer: Box<dyn PageWriter + 'a>,
+        on_close: OnCloseColumnChunk<'a>,
+    ) -> Result<Self> {
+        Ok(Self {
+            writer: GenericColumnWriter::new(descr, props.clone(), page_writer),
+            on_close: Some(on_close),
+        })
+    }
+
+    pub fn write(&mut self, array: &ArrayRef, levels: LevelInfo) -> Result<()> {
+        self.writer.write_batch_internal(
             array,
             Some(levels.non_null_indices()),
             levels.def_levels(),
@@ -92,18 +126,11 @@ impl<'a> ArrayWriter for ByteArrayWriter<'a> {
         Ok(())
     }
 
-    fn close(&mut self) -> Result<()> {
-        let (bytes_written, rows_written, metadata, column_index, offset_index) =
-            self.writer.take().unwrap().close()?;
+    pub fn close(self) -> Result<()> {
+        let r = self.writer.close()?;
 
-        if let Some(on_close) = self.on_close.take() {
-            on_close(
-                bytes_written,
-                rows_written,
-                metadata,
-                column_index,
-                offset_index,
-            )?;
+        if let Some(on_close) = self.on_close {
+            on_close(r)?;
         }
         Ok(())
     }
@@ -352,8 +379,7 @@ impl DictEncoder {
 
     fn estimated_data_page_size(&self) -> usize {
         let bit_width = self.bit_width();
-        1 + RleEncoder::min_buffer_size(bit_width)
-            + RleEncoder::max_buffer_size(bit_width, self.indices.len())
+        1 + RleEncoder::max_buffer_size(bit_width, self.indices.len())
     }
 
     fn estimated_dict_page_size(&self) -> usize {
@@ -400,7 +426,6 @@ impl DictEncoder {
 struct ByteArrayEncoder {
     fallback: FallbackEncoder,
     dict_encoder: Option<DictEncoder>,
-    num_values: usize,
     min_value: Option<ByteArray>,
     max_value: Option<ByteArray>,
 }
@@ -439,7 +464,6 @@ impl ColumnValueEncoder for ByteArrayEncoder {
         Ok(Self {
             fallback,
             dict_encoder: dictionary,
-            num_values: 0,
             min_value: None,
             max_value: None,
         })
@@ -460,7 +484,10 @@ impl ColumnValueEncoder for ByteArrayEncoder {
     }
 
     fn num_values(&self) -> usize {
-        self.num_values
+        match &self.dict_encoder {
+            Some(encoder) => encoder.indices.len(),
+            None => self.fallback.num_values,
+        }
     }
 
     fn has_dictionary(&self) -> bool {
@@ -481,7 +508,7 @@ impl ColumnValueEncoder for ByteArrayEncoder {
     fn flush_dict_page(&mut self) -> Result<Option<DictionaryPage>> {
         match self.dict_encoder.take() {
             Some(encoder) => {
-                if self.num_values != 0 {
+                if !encoder.indices.is_empty() {
                     return Err(general_err!(
                         "Must flush data pages before flushing dictionary"
                     ));
