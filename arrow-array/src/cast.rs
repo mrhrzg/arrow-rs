@@ -19,6 +19,15 @@
 
 use crate::array::*;
 use crate::types::*;
+use arrow_data::ArrayData;
+
+/// Re-export symbols needed for downcast macros
+///
+/// Name follows `serde` convention
+#[doc(hidden)]
+pub mod __private {
+    pub use arrow_schema::{DataType, IntervalUnit, TimeUnit};
+}
 
 /// Repeats the provided pattern based on the number of comma separated identifiers
 #[doc(hidden)]
@@ -63,33 +72,125 @@ macro_rules! repeat_pat {
 /// [`DataType`]: arrow_schema::DataType
 #[macro_export]
 macro_rules! downcast_integer {
-    ($($data_type:expr),+ => ($m:path $(, $args:tt)*), $($($p:pat),+ => $fallback:expr $(,)*)*) => {
+    ($($data_type:expr),+ => ($m:path $(, $args:tt)*), $($p:pat => $fallback:expr $(,)*)*) => {
         match ($($data_type),+) {
-            $crate::repeat_pat!(arrow_schema::DataType::Int8, $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Int8, $($data_type),+) => {
                 $m!($crate::types::Int8Type $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Int16, $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Int16, $($data_type),+) => {
                 $m!($crate::types::Int16Type $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Int32, $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Int32, $($data_type),+) => {
                 $m!($crate::types::Int32Type $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Int64, $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Int64, $($data_type),+) => {
                 $m!($crate::types::Int64Type $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::UInt8, $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::UInt8, $($data_type),+) => {
                 $m!($crate::types::UInt8Type $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::UInt16, $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::UInt16, $($data_type),+) => {
                 $m!($crate::types::UInt16Type $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::UInt32, $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::UInt32, $($data_type),+) => {
                 $m!($crate::types::UInt32Type $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::UInt64, $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::UInt64, $($data_type),+) => {
                 $m!($crate::types::UInt64Type $(, $args)*)
             }
-            $(($($p),+) => $fallback,)*
+            $($p => $fallback,)*
+        }
+    };
+}
+
+/// Given one or more expressions evaluating to an integer [`PrimitiveArray`] invokes the provided macro
+/// with the corresponding array, along with match statements for any non integer array types
+///
+/// ```
+/// # use arrow_array::{Array, downcast_integer_array, cast::as_string_array};
+/// # use arrow_schema::DataType;
+///
+/// fn print_integer(array: &dyn Array) {
+///     downcast_integer_array!(
+///         array => {
+///             for v in array {
+///                 println!("{:?}", v);
+///             }
+///         }
+///         DataType::Utf8 => {
+///             for v in as_string_array(array) {
+///                 println!("{:?}", v);
+///             }
+///         }
+///         t => println!("Unsupported datatype {}", t)
+///     )
+/// }
+/// ```
+///
+/// [`DataType`]: arrow_schema::DataType
+#[macro_export]
+macro_rules! downcast_integer_array {
+    ($values:ident => $e:expr, $($p:pat => $fallback:expr $(,)*)*) => {
+        $crate::downcast_integer_array!($values => {$e} $($p => $fallback)*)
+    };
+    (($($values:ident),+) => $e:expr, $($p:pat => $fallback:expr $(,)*)*) => {
+        $crate::downcast_integer_array!($($values),+ => {$e} $($p => $fallback)*)
+    };
+    ($($values:ident),+ => $e:block $($p:pat => $fallback:expr $(,)*)*) => {
+        $crate::downcast_integer_array!(($($values),+) => $e $($p => $fallback)*)
+    };
+    (($($values:ident),+) => $e:block $($p:pat => $fallback:expr $(,)*)*) => {
+        $crate::downcast_integer!{
+            $($values.data_type()),+ => ($crate::downcast_primitive_array_helper, $($values),+, $e),
+            $($p => $fallback,)*
+        }
+    };
+}
+
+/// Given one or more expressions evaluating to an integer [`DataType`] invokes the provided macro
+/// `m` with the corresponding integer [`RunEndIndexType`], followed by any additional arguments
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::{downcast_primitive, ArrowPrimitiveType, downcast_run_end_index};
+/// # use arrow_schema::{DataType, Field};
+///
+/// macro_rules! run_end_size_helper {
+///   ($t:ty, $o:ty) => {
+///       std::mem::size_of::<<$t as ArrowPrimitiveType>::Native>() as $o
+///   };
+/// }
+///
+/// fn run_end_index_size(t: &DataType) -> u8 {
+///     match t {
+///         DataType::RunEndEncoded(k, _) => downcast_run_end_index! {
+///             k.data_type() => (run_end_size_helper, u8),
+///             _ => unreachable!(),
+///         },
+///         _ => u8::MAX,
+///     }
+/// }
+///
+/// assert_eq!(run_end_index_size(&DataType::RunEndEncoded(Arc::new(Field::new("a", DataType::Int32, false)), Arc::new(Field::new("b", DataType::Utf8, true)))), 4);
+/// assert_eq!(run_end_index_size(&DataType::RunEndEncoded(Arc::new(Field::new("a", DataType::Int64, false)), Arc::new(Field::new("b", DataType::Utf8, true)))), 8);
+/// assert_eq!(run_end_index_size(&DataType::RunEndEncoded(Arc::new(Field::new("a", DataType::Int16, false)), Arc::new(Field::new("b", DataType::Utf8, true)))), 2);
+/// ```
+///
+/// [`DataType`]: arrow_schema::DataType
+#[macro_export]
+macro_rules! downcast_run_end_index {
+    ($($data_type:expr),+ => ($m:path $(, $args:tt)*), $($p:pat => $fallback:expr $(,)*)*) => {
+        match ($($data_type),+) {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Int16, $($data_type),+) => {
+                $m!($crate::types::Int16Type $(, $args)*)
+            }
+            $crate::repeat_pat!($crate::cast::__private::DataType::Int32, $($data_type),+) => {
+                $m!($crate::types::Int32Type $(, $args)*)
+            }
+            $crate::repeat_pat!($crate::cast::__private::DataType::Int64, $($data_type),+) => {
+                $m!($crate::types::Int64Type $(, $args)*)
+            }
+            $($p => $fallback,)*
         }
     };
 }
@@ -121,39 +222,39 @@ macro_rules! downcast_integer {
 /// [`DataType`]: arrow_schema::DataType
 #[macro_export]
 macro_rules! downcast_temporal {
-    ($($data_type:expr),+ => ($m:path $(, $args:tt)*), $($($p:pat),+ => $fallback:expr $(,)*)*) => {
+    ($($data_type:expr),+ => ($m:path $(, $args:tt)*), $($p:pat => $fallback:expr $(,)*)*) => {
         match ($($data_type),+) {
-            $crate::repeat_pat!(arrow_schema::DataType::Time32(arrow_schema::TimeUnit::Second), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Time32($crate::cast::__private::TimeUnit::Second), $($data_type),+) => {
                 $m!($crate::types::Time32SecondType $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Time32(arrow_schema::TimeUnit::Millisecond), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Time32($crate::cast::__private::TimeUnit::Millisecond), $($data_type),+) => {
                 $m!($crate::types::Time32MillisecondType $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Time64(arrow_schema::TimeUnit::Microsecond), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Time64($crate::cast::__private::TimeUnit::Microsecond), $($data_type),+) => {
                 $m!($crate::types::Time64MicrosecondType $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Time64(arrow_schema::TimeUnit::Nanosecond), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Time64($crate::cast::__private::TimeUnit::Nanosecond), $($data_type),+) => {
                 $m!($crate::types::Time64NanosecondType $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Date32, $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Date32, $($data_type),+) => {
                 $m!($crate::types::Date32Type $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Date64, $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Date64, $($data_type),+) => {
                 $m!($crate::types::Date64Type $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Second, _), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Timestamp($crate::cast::__private::TimeUnit::Second, _), $($data_type),+) => {
                 $m!($crate::types::TimestampSecondType $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, _), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Timestamp($crate::cast::__private::TimeUnit::Millisecond, _), $($data_type),+) => {
                 $m!($crate::types::TimestampMillisecondType $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Timestamp($crate::cast::__private::TimeUnit::Microsecond, _), $($data_type),+) => {
                 $m!($crate::types::TimestampMicrosecondType $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, _), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Timestamp($crate::cast::__private::TimeUnit::Nanosecond, _), $($data_type),+) => {
                 $m!($crate::types::TimestampNanosecondType $(, $args)*)
             }
-            $(($($p),+) => $fallback,)*
+            $($p => $fallback,)*
         }
     };
 }
@@ -188,16 +289,16 @@ macro_rules! downcast_temporal_array {
     ($values:ident => $e:expr, $($p:pat => $fallback:expr $(,)*)*) => {
         $crate::downcast_temporal_array!($values => {$e} $($p => $fallback)*)
     };
-    (($($values:ident),+) => $e:block $($($p:pat),+ => $fallback:expr $(,)*)*) => {
-        $crate::downcast_temporal_array!($($values),+ => $e $($($p),+ => $fallback)*)
+    (($($values:ident),+) => $e:expr, $($p:pat => $fallback:expr $(,)*)*) => {
+        $crate::downcast_temporal_array!($($values),+ => {$e} $($p => $fallback)*)
     };
-    (($($values:ident),+) => $e:block $(($($p:pat),+) => $fallback:expr $(,)*)*) => {
-        $crate::downcast_temporal_array!($($values),+ => $e $($($p),+ => $fallback)*)
+    ($($values:ident),+ => $e:block $($p:pat => $fallback:expr $(,)*)*) => {
+        $crate::downcast_temporal_array!(($($values),+) => $e $($p => $fallback)*)
     };
-    ($($values:ident),+ => $e:block $($($p:pat),+ => $fallback:expr $(,)*)*) => {
+    (($($values:ident),+) => $e:block $($p:pat => $fallback:expr $(,)*)*) => {
         $crate::downcast_temporal!{
             $($values.data_type()),+ => ($crate::downcast_primitive_array_helper, $($values),+, $e),
-            $($($p),+ => $fallback,)*
+            $($p => $fallback,)*
         }
     };
 }
@@ -225,48 +326,56 @@ macro_rules! downcast_temporal_array {
 /// assert_eq!(primitive_size(&DataType::Int32), 4);
 /// assert_eq!(primitive_size(&DataType::Int64), 8);
 /// assert_eq!(primitive_size(&DataType::Float16), 2);
+/// assert_eq!(primitive_size(&DataType::Decimal128(38, 10)), 16);
+/// assert_eq!(primitive_size(&DataType::Decimal256(76, 20)), 32);
 /// ```
 ///
 /// [`DataType`]: arrow_schema::DataType
 #[macro_export]
 macro_rules! downcast_primitive {
-    ($($data_type:expr),+ => ($m:path $(, $args:tt)*), $($($p:pat),+ => $fallback:expr $(,)*)*) => {
+    ($($data_type:expr),+ => ($m:path $(, $args:tt)*), $($p:pat => $fallback:expr $(,)*)*) => {
         $crate::downcast_integer! {
             $($data_type),+ => ($m $(, $args)*),
-            $crate::repeat_pat!(arrow_schema::DataType::Float16, $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Float16, $($data_type),+) => {
                 $m!($crate::types::Float16Type $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Float32, $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Float32, $($data_type),+) => {
                 $m!($crate::types::Float32Type $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Float64, $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Float64, $($data_type),+) => {
                 $m!($crate::types::Float64Type $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Interval(arrow_schema::IntervalUnit::YearMonth), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Decimal128(_, _), $($data_type),+) => {
+                $m!($crate::types::Decimal128Type $(, $args)*)
+            }
+            $crate::repeat_pat!($crate::cast::__private::DataType::Decimal256(_, _), $($data_type),+) => {
+                $m!($crate::types::Decimal256Type $(, $args)*)
+            }
+            $crate::repeat_pat!($crate::cast::__private::DataType::Interval($crate::cast::__private::IntervalUnit::YearMonth), $($data_type),+) => {
                 $m!($crate::types::IntervalYearMonthType $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Interval(arrow_schema::IntervalUnit::DayTime), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Interval($crate::cast::__private::IntervalUnit::DayTime), $($data_type),+) => {
                 $m!($crate::types::IntervalDayTimeType $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Interval($crate::cast::__private::IntervalUnit::MonthDayNano), $($data_type),+) => {
                 $m!($crate::types::IntervalMonthDayNanoType $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Duration(arrow_schema::TimeUnit::Second), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Duration($crate::cast::__private::TimeUnit::Second), $($data_type),+) => {
                 $m!($crate::types::DurationSecondType $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Duration(arrow_schema::TimeUnit::Millisecond), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Duration($crate::cast::__private::TimeUnit::Millisecond), $($data_type),+) => {
                 $m!($crate::types::DurationMillisecondType $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Duration(arrow_schema::TimeUnit::Microsecond), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Duration($crate::cast::__private::TimeUnit::Microsecond), $($data_type),+) => {
                 $m!($crate::types::DurationMicrosecondType $(, $args)*)
             }
-            $crate::repeat_pat!(arrow_schema::DataType::Duration(arrow_schema::TimeUnit::Nanosecond), $($data_type),+) => {
+            $crate::repeat_pat!($crate::cast::__private::DataType::Duration($crate::cast::__private::TimeUnit::Nanosecond), $($data_type),+) => {
                 $m!($crate::types::DurationNanosecondType $(, $args)*)
             }
             _ => {
                 $crate::downcast_temporal! {
                     $($data_type),+ => ($m $(, $args)*),
-                    $($($p),+ => $fallback,)*
+                    $($p => $fallback,)*
                 }
             }
         }
@@ -312,16 +421,16 @@ macro_rules! downcast_primitive_array {
     ($values:ident => $e:expr, $($p:pat => $fallback:expr $(,)*)*) => {
         $crate::downcast_primitive_array!($values => {$e} $($p => $fallback)*)
     };
-    (($($values:ident),+) => $e:block $($($p:pat),+ => $fallback:expr $(,)*)*) => {
-        $crate::downcast_primitive_array!($($values),+ => $e $($($p),+ => $fallback)*)
+    (($($values:ident),+) => $e:expr, $($p:pat => $fallback:expr $(,)*)*) => {
+        $crate::downcast_primitive_array!($($values),+ => {$e} $($p => $fallback)*)
     };
-    (($($values:ident),+) => $e:block $(($($p:pat),+) => $fallback:expr $(,)*)*) => {
-        $crate::downcast_primitive_array!($($values),+ => $e $($($p),+ => $fallback)*)
+    ($($values:ident),+ => $e:block $($p:pat => $fallback:expr $(,)*)*) => {
+        $crate::downcast_primitive_array!(($($values),+) => $e $($p => $fallback)*)
     };
-    ($($values:ident),+ => $e:block $($($p:pat),+ => $fallback:expr $(,)*)*) => {
+    (($($values:ident),+) => $e:block $($p:pat => $fallback:expr $(,)*)*) => {
         $crate::downcast_primitive!{
             $($values.data_type()),+ => ($crate::downcast_primitive_array_helper, $($values),+, $e),
-            $($($p),+ => $fallback,)*
+            $($p => $fallback,)*
         }
     };
 }
@@ -339,7 +448,7 @@ macro_rules! downcast_primitive_array {
 ///
 /// let arr: ArrayRef = Arc::new(Int32Array::from(vec![Some(1)]));
 ///
-/// // Downcast an `ArrayRef` to Int32Array / PrimiveArray<Int32>:
+/// // Downcast an `ArrayRef` to Int32Array / PrimitiveArray<Int32>:
 /// let primitive_array: &Int32Array = as_primitive_array(&arr);
 ///
 /// // Equivalently:
@@ -351,7 +460,6 @@ macro_rules! downcast_primitive_array {
 ///     .downcast_ref::<Int32Array>()
 ///     .unwrap();
 /// ```
-
 pub fn as_primitive_array<T>(arr: &dyn Array) -> &PrimitiveArray<T>
 where
     T: ArrowPrimitiveType,
@@ -406,7 +514,7 @@ macro_rules! downcast_dictionary_array {
 
     ($values:ident => $e:block $($p:pat => $fallback:expr $(,)*)*) => {
         match $values.data_type() {
-            arrow_schema::DataType::Dictionary(k, _) => {
+            $crate::cast::__private::DataType::Dictionary(k, _) => {
                 $crate::downcast_integer! {
                     k.as_ref() => ($crate::downcast_dictionary_array_helper, $values, $e),
                     k => unreachable!("unsupported dictionary key type: {}", k)
@@ -441,42 +549,126 @@ where
 }
 
 /// Force downcast of an [`Array`], such as an [`ArrayRef`] to
-/// [`GenericListArray<T>`], panic'ing on failure.
-pub fn as_generic_list_array<S: OffsetSizeTrait>(
-    arr: &dyn Array,
-) -> &GenericListArray<S> {
+/// [`RunArray<T>`], panic'ing on failure.
+///
+/// # Example
+///
+/// ```
+/// # use arrow_array::{ArrayRef, RunArray};
+/// # use arrow_array::cast::as_run_array;
+/// # use arrow_array::types::Int32Type;
+///
+/// let arr: RunArray<Int32Type> = vec![Some("foo")].into_iter().collect();
+/// let arr: ArrayRef = std::sync::Arc::new(arr);
+/// let run_array: &RunArray<Int32Type> = as_run_array::<Int32Type>(&arr);
+/// ```
+pub fn as_run_array<T>(arr: &dyn Array) -> &RunArray<T>
+where
+    T: RunEndIndexType,
+{
+    arr.as_any()
+        .downcast_ref::<RunArray<T>>()
+        .expect("Unable to downcast to run array")
+}
+
+#[macro_export]
+#[doc(hidden)]
+macro_rules! downcast_run_array_helper {
+    ($t:ty, $($values:ident),+, $e:block) => {{
+        $(let $values = $crate::cast::as_run_array::<$t>($values);)+
+        $e
+    }};
+}
+
+/// Downcast an [`Array`] to a [`RunArray`] based on its [`DataType`], accepts
+/// a number of subsequent patterns to match the data type
+///
+/// ```
+/// # use arrow_array::{Array, StringArray, downcast_run_array, cast::as_string_array};
+/// # use arrow_schema::DataType;
+///
+/// fn print_strings(array: &dyn Array) {
+///     downcast_run_array!(
+///         array => match array.values().data_type() {
+///             DataType::Utf8 => {
+///                 for v in array.downcast::<StringArray>().unwrap() {
+///                     println!("{:?}", v);
+///                 }
+///             }
+///             t => println!("Unsupported run array value type {}", t),
+///         },
+///         DataType::Utf8 => {
+///             for v in as_string_array(array) {
+///                 println!("{:?}", v);
+///             }
+///         }
+///         t => println!("Unsupported datatype {}", t)
+///     )
+/// }
+/// ```
+///
+/// [`DataType`]: arrow_schema::DataType
+#[macro_export]
+macro_rules! downcast_run_array {
+    ($values:ident => $e:expr, $($p:pat => $fallback:expr $(,)*)*) => {
+        downcast_run_array!($values => {$e} $($p => $fallback)*)
+    };
+
+    ($values:ident => $e:block $($p:pat => $fallback:expr $(,)*)*) => {
+        match $values.data_type() {
+            $crate::cast::__private::DataType::RunEndEncoded(k, _) => {
+                $crate::downcast_run_end_index! {
+                    k.data_type() => ($crate::downcast_run_array_helper, $values, $e),
+                    k => unreachable!("unsupported run end index type: {}", k)
+                }
+            }
+            $($p => $fallback,)*
+        }
+    }
+}
+
+/// Force downcast of an [`Array`], such as an [`ArrayRef`] to
+/// [`GenericListArray<T>`], panicking on failure.
+pub fn as_generic_list_array<S: OffsetSizeTrait>(arr: &dyn Array) -> &GenericListArray<S> {
     arr.as_any()
         .downcast_ref::<GenericListArray<S>>()
         .expect("Unable to downcast to list array")
 }
 
 /// Force downcast of an [`Array`], such as an [`ArrayRef`] to
-/// [`ListArray`], panic'ing on failure.
+/// [`ListArray`], panicking on failure.
 #[inline]
 pub fn as_list_array(arr: &dyn Array) -> &ListArray {
     as_generic_list_array::<i32>(arr)
 }
 
 /// Force downcast of an [`Array`], such as an [`ArrayRef`] to
-/// [`LargeListArray`], panic'ing on failure.
+/// [`FixedSizeListArray`], panicking on failure.
+#[inline]
+pub fn as_fixed_size_list_array(arr: &dyn Array) -> &FixedSizeListArray {
+    arr.as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .expect("Unable to downcast to fixed size list array")
+}
+
+/// Force downcast of an [`Array`], such as an [`ArrayRef`] to
+/// [`LargeListArray`], panicking on failure.
 #[inline]
 pub fn as_large_list_array(arr: &dyn Array) -> &LargeListArray {
     as_generic_list_array::<i64>(arr)
 }
 
 /// Force downcast of an [`Array`], such as an [`ArrayRef`] to
-/// [`GenericBinaryArray<S>`], panic'ing on failure.
+/// [`GenericBinaryArray<S>`], panicking on failure.
 #[inline]
-pub fn as_generic_binary_array<S: OffsetSizeTrait>(
-    arr: &dyn Array,
-) -> &GenericBinaryArray<S> {
+pub fn as_generic_binary_array<S: OffsetSizeTrait>(arr: &dyn Array) -> &GenericBinaryArray<S> {
     arr.as_any()
         .downcast_ref::<GenericBinaryArray<S>>()
         .expect("Unable to downcast to binary array")
 }
 
 /// Force downcast of an [`Array`], such as an [`ArrayRef`] to
-/// [`StringArray`], panic'ing on failure.
+/// [`StringArray`], panicking on failure.
 ///
 /// # Example
 ///
@@ -495,7 +687,7 @@ pub fn as_string_array(arr: &dyn Array) -> &StringArray {
 }
 
 /// Force downcast of an [`Array`], such as an [`ArrayRef`] to
-/// [`BooleanArray`], panic'ing on failure.
+/// [`BooleanArray`], panicking on failure.
 ///
 /// # Example
 ///
@@ -530,7 +722,7 @@ macro_rules! array_downcast_fn {
         array_downcast_fn!(
             $name,
             $arrty,
-            concat!("[`", stringify!($arrty), "`], panic'ing on failure.")
+            concat!("[`", stringify!($arrty), "`], panicking on failure.")
         );
     };
 }
@@ -540,26 +732,321 @@ array_downcast_fn!(as_null_array, NullArray);
 array_downcast_fn!(as_struct_array, StructArray);
 array_downcast_fn!(as_union_array, UnionArray);
 array_downcast_fn!(as_map_array, MapArray);
-array_downcast_fn!(as_decimal_array, Decimal128Array);
+
+/// Downcasts a `dyn Array` to a concrete type
+///
+/// ```
+/// # use arrow_array::{BooleanArray, Int32Array, RecordBatch, StringArray};
+/// # use arrow_array::cast::downcast_array;
+/// struct ConcreteBatch {
+///     col1: Int32Array,
+///     col2: BooleanArray,
+///     col3: StringArray,
+/// }
+///
+/// impl ConcreteBatch {
+///     fn new(batch: &RecordBatch) -> Self {
+///         Self {
+///             col1: downcast_array(batch.column(0).as_ref()),
+///             col2: downcast_array(batch.column(1).as_ref()),
+///             col3: downcast_array(batch.column(2).as_ref()),
+///         }
+///     }
+/// }
+/// ```
+///
+/// # Panics
+///
+/// Panics if array is not of the correct data type
+pub fn downcast_array<T>(array: &dyn Array) -> T
+where
+    T: From<ArrayData>,
+{
+    T::from(array.to_data())
+}
+
+mod private {
+    pub trait Sealed {}
+}
+
+/// An extension trait for `dyn Array` that provides ergonomic downcasting
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::{ArrayRef, Int32Array};
+/// # use arrow_array::cast::AsArray;
+/// # use arrow_array::types::Int32Type;
+/// let col = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+/// assert_eq!(col.as_primitive::<Int32Type>().values(), &[1, 2, 3]);
+/// ```
+pub trait AsArray: private::Sealed {
+    /// Downcast this to a [`BooleanArray`] returning `None` if not possible
+    fn as_boolean_opt(&self) -> Option<&BooleanArray>;
+
+    /// Downcast this to a [`BooleanArray`] panicking if not possible
+    fn as_boolean(&self) -> &BooleanArray {
+        self.as_boolean_opt().expect("boolean array")
+    }
+
+    /// Downcast this to a [`PrimitiveArray`] returning `None` if not possible
+    fn as_primitive_opt<T: ArrowPrimitiveType>(&self) -> Option<&PrimitiveArray<T>>;
+
+    /// Downcast this to a [`PrimitiveArray`] panicking if not possible
+    fn as_primitive<T: ArrowPrimitiveType>(&self) -> &PrimitiveArray<T> {
+        self.as_primitive_opt().expect("primitive array")
+    }
+
+    /// Downcast this to a [`GenericByteArray`] returning `None` if not possible
+    fn as_bytes_opt<T: ByteArrayType>(&self) -> Option<&GenericByteArray<T>>;
+
+    /// Downcast this to a [`GenericByteArray`] panicking if not possible
+    fn as_bytes<T: ByteArrayType>(&self) -> &GenericByteArray<T> {
+        self.as_bytes_opt().expect("byte array")
+    }
+
+    /// Downcast this to a [`GenericStringArray`] returning `None` if not possible
+    fn as_string_opt<O: OffsetSizeTrait>(&self) -> Option<&GenericStringArray<O>> {
+        self.as_bytes_opt()
+    }
+
+    /// Downcast this to a [`GenericStringArray`] panicking if not possible
+    fn as_string<O: OffsetSizeTrait>(&self) -> &GenericStringArray<O> {
+        self.as_bytes_opt().expect("string array")
+    }
+
+    /// Downcast this to a [`GenericBinaryArray`] returning `None` if not possible
+    fn as_binary_opt<O: OffsetSizeTrait>(&self) -> Option<&GenericBinaryArray<O>> {
+        self.as_bytes_opt()
+    }
+
+    /// Downcast this to a [`GenericBinaryArray`] panicking if not possible
+    fn as_binary<O: OffsetSizeTrait>(&self) -> &GenericBinaryArray<O> {
+        self.as_bytes_opt().expect("binary array")
+    }
+
+    /// Downcast this to a [`StringViewArray`] returning `None` if not possible
+    fn as_string_view_opt(&self) -> Option<&StringViewArray> {
+        self.as_byte_view_opt()
+    }
+
+    /// Downcast this to a [`StringViewArray`] panicking if not possible
+    fn as_string_view(&self) -> &StringViewArray {
+        self.as_byte_view_opt().expect("string view array")
+    }
+
+    /// Downcast this to a [`BinaryViewArray`] returning `None` if not possible
+    fn as_binary_view_opt(&self) -> Option<&BinaryViewArray> {
+        self.as_byte_view_opt()
+    }
+
+    /// Downcast this to a [`BinaryViewArray`] panicking if not possible
+    fn as_binary_view(&self) -> &BinaryViewArray {
+        self.as_byte_view_opt().expect("binary view array")
+    }
+
+    /// Downcast this to a [`GenericByteViewArray`] returning `None` if not possible
+    fn as_byte_view_opt<T: ByteViewType>(&self) -> Option<&GenericByteViewArray<T>>;
+
+    /// Downcast this to a [`GenericByteViewArray`] panicking if not possible
+    fn as_byte_view<T: ByteViewType>(&self) -> &GenericByteViewArray<T> {
+        self.as_byte_view_opt().expect("byte view array")
+    }
+
+    /// Downcast this to a [`StructArray`] returning `None` if not possible
+    fn as_struct_opt(&self) -> Option<&StructArray>;
+
+    /// Downcast this to a [`StructArray`] panicking if not possible
+    fn as_struct(&self) -> &StructArray {
+        self.as_struct_opt().expect("struct array")
+    }
+
+    /// Downcast this to a [`UnionArray`] returning `None` if not possible
+    fn as_union_opt(&self) -> Option<&UnionArray>;
+
+    /// Downcast this to a [`UnionArray`] panicking if not possible
+    fn as_union(&self) -> &UnionArray {
+        self.as_union_opt().expect("union array")
+    }
+
+    /// Downcast this to a [`GenericListArray`] returning `None` if not possible
+    fn as_list_opt<O: OffsetSizeTrait>(&self) -> Option<&GenericListArray<O>>;
+
+    /// Downcast this to a [`GenericListArray`] panicking if not possible
+    fn as_list<O: OffsetSizeTrait>(&self) -> &GenericListArray<O> {
+        self.as_list_opt().expect("list array")
+    }
+
+    /// Downcast this to a [`GenericListViewArray`] returning `None` if not possible
+    fn as_list_view_opt<O: OffsetSizeTrait>(&self) -> Option<&GenericListViewArray<O>>;
+
+    /// Downcast this to a [`GenericListViewArray`] panicking if not possible
+    fn as_list_view<O: OffsetSizeTrait>(&self) -> &GenericListViewArray<O> {
+        self.as_list_view_opt().expect("list view array")
+    }
+
+    /// Downcast this to a [`FixedSizeBinaryArray`] returning `None` if not possible
+    fn as_fixed_size_binary_opt(&self) -> Option<&FixedSizeBinaryArray>;
+
+    /// Downcast this to a [`FixedSizeBinaryArray`] panicking if not possible
+    fn as_fixed_size_binary(&self) -> &FixedSizeBinaryArray {
+        self.as_fixed_size_binary_opt()
+            .expect("fixed size binary array")
+    }
+
+    /// Downcast this to a [`FixedSizeListArray`] returning `None` if not possible
+    fn as_fixed_size_list_opt(&self) -> Option<&FixedSizeListArray>;
+
+    /// Downcast this to a [`FixedSizeListArray`] panicking if not possible
+    fn as_fixed_size_list(&self) -> &FixedSizeListArray {
+        self.as_fixed_size_list_opt()
+            .expect("fixed size list array")
+    }
+
+    /// Downcast this to a [`MapArray`] returning `None` if not possible
+    fn as_map_opt(&self) -> Option<&MapArray>;
+
+    /// Downcast this to a [`MapArray`] panicking if not possible
+    fn as_map(&self) -> &MapArray {
+        self.as_map_opt().expect("map array")
+    }
+
+    /// Downcast this to a [`DictionaryArray`] returning `None` if not possible
+    fn as_dictionary_opt<K: ArrowDictionaryKeyType>(&self) -> Option<&DictionaryArray<K>>;
+
+    /// Downcast this to a [`DictionaryArray`] panicking if not possible
+    fn as_dictionary<K: ArrowDictionaryKeyType>(&self) -> &DictionaryArray<K> {
+        self.as_dictionary_opt().expect("dictionary array")
+    }
+
+    /// Downcasts this to a [`AnyDictionaryArray`] returning `None` if not possible
+    fn as_any_dictionary_opt(&self) -> Option<&dyn AnyDictionaryArray>;
+
+    /// Downcasts this to a [`AnyDictionaryArray`] panicking if not possible
+    fn as_any_dictionary(&self) -> &dyn AnyDictionaryArray {
+        self.as_any_dictionary_opt().expect("any dictionary array")
+    }
+}
+
+impl private::Sealed for dyn Array + '_ {}
+impl AsArray for dyn Array + '_ {
+    fn as_boolean_opt(&self) -> Option<&BooleanArray> {
+        self.as_any().downcast_ref()
+    }
+
+    fn as_primitive_opt<T: ArrowPrimitiveType>(&self) -> Option<&PrimitiveArray<T>> {
+        self.as_any().downcast_ref()
+    }
+
+    fn as_bytes_opt<T: ByteArrayType>(&self) -> Option<&GenericByteArray<T>> {
+        self.as_any().downcast_ref()
+    }
+
+    fn as_byte_view_opt<T: ByteViewType>(&self) -> Option<&GenericByteViewArray<T>> {
+        self.as_any().downcast_ref()
+    }
+
+    fn as_struct_opt(&self) -> Option<&StructArray> {
+        self.as_any().downcast_ref()
+    }
+
+    fn as_union_opt(&self) -> Option<&UnionArray> {
+        self.as_any().downcast_ref()
+    }
+
+    fn as_list_opt<O: OffsetSizeTrait>(&self) -> Option<&GenericListArray<O>> {
+        self.as_any().downcast_ref()
+    }
+
+    fn as_list_view_opt<O: OffsetSizeTrait>(&self) -> Option<&GenericListViewArray<O>> {
+        self.as_any().downcast_ref()
+    }
+
+    fn as_fixed_size_binary_opt(&self) -> Option<&FixedSizeBinaryArray> {
+        self.as_any().downcast_ref()
+    }
+
+    fn as_fixed_size_list_opt(&self) -> Option<&FixedSizeListArray> {
+        self.as_any().downcast_ref()
+    }
+
+    fn as_map_opt(&self) -> Option<&MapArray> {
+        self.as_any().downcast_ref()
+    }
+
+    fn as_dictionary_opt<K: ArrowDictionaryKeyType>(&self) -> Option<&DictionaryArray<K>> {
+        self.as_any().downcast_ref()
+    }
+
+    fn as_any_dictionary_opt(&self) -> Option<&dyn AnyDictionaryArray> {
+        let array = self;
+        downcast_dictionary_array! {
+            array => Some(array),
+            _ => None
+        }
+    }
+}
+
+impl private::Sealed for ArrayRef {}
+impl AsArray for ArrayRef {
+    fn as_boolean_opt(&self) -> Option<&BooleanArray> {
+        self.as_ref().as_boolean_opt()
+    }
+
+    fn as_primitive_opt<T: ArrowPrimitiveType>(&self) -> Option<&PrimitiveArray<T>> {
+        self.as_ref().as_primitive_opt()
+    }
+
+    fn as_bytes_opt<T: ByteArrayType>(&self) -> Option<&GenericByteArray<T>> {
+        self.as_ref().as_bytes_opt()
+    }
+
+    fn as_byte_view_opt<T: ByteViewType>(&self) -> Option<&GenericByteViewArray<T>> {
+        self.as_ref().as_byte_view_opt()
+    }
+
+    fn as_struct_opt(&self) -> Option<&StructArray> {
+        self.as_ref().as_struct_opt()
+    }
+
+    fn as_union_opt(&self) -> Option<&UnionArray> {
+        self.as_any().downcast_ref()
+    }
+
+    fn as_list_opt<O: OffsetSizeTrait>(&self) -> Option<&GenericListArray<O>> {
+        self.as_ref().as_list_opt()
+    }
+
+    fn as_list_view_opt<O: OffsetSizeTrait>(&self) -> Option<&GenericListViewArray<O>> {
+        self.as_ref().as_list_view_opt()
+    }
+
+    fn as_fixed_size_binary_opt(&self) -> Option<&FixedSizeBinaryArray> {
+        self.as_ref().as_fixed_size_binary_opt()
+    }
+
+    fn as_fixed_size_list_opt(&self) -> Option<&FixedSizeListArray> {
+        self.as_ref().as_fixed_size_list_opt()
+    }
+
+    fn as_map_opt(&self) -> Option<&MapArray> {
+        self.as_any().downcast_ref()
+    }
+
+    fn as_dictionary_opt<K: ArrowDictionaryKeyType>(&self) -> Option<&DictionaryArray<K>> {
+        self.as_ref().as_dictionary_opt()
+    }
+
+    fn as_any_dictionary_opt(&self) -> Option<&dyn AnyDictionaryArray> {
+        self.as_ref().as_any_dictionary_opt()
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use arrow_buffer::i256;
-    use std::sync::Arc;
-
     use super::*;
-
-    #[test]
-    fn test_as_decimal_array_ref() {
-        let array: Decimal128Array = vec![Some(123), None, Some(1111)]
-            .into_iter()
-            .collect::<Decimal128Array>()
-            .with_precision_and_scale(10, 2)
-            .unwrap();
-        assert!(!as_decimal_array(&array).is_empty());
-        let result_decimal = as_decimal_array(&array);
-        assert_eq!(result_decimal, &array);
-    }
+    use arrow_buffer::i256;
+    use arrow_schema::DataType;
+    use std::sync::Arc;
 
     #[test]
     fn test_as_primitive_array_ref() {
@@ -589,9 +1076,49 @@ mod tests {
 
     #[test]
     fn test_decimal256array() {
-        let a = Decimal256Array::from_iter_values(
-            [1, 2, 4, 5].into_iter().map(i256::from_i128),
-        );
+        let a = Decimal256Array::from_iter_values([1, 2, 4, 5].into_iter().map(i256::from_i128));
         assert!(!as_primitive_array::<Decimal256Type>(&a).is_empty());
+    }
+
+    #[test]
+    fn downcast_integer_array_should_match_only_integers() {
+        let i32_array: ArrayRef = Arc::new(Int32Array::new_null(1));
+        let i32_array_ref = &i32_array;
+        downcast_integer_array!(
+            i32_array_ref => {
+                assert_eq!(i32_array_ref.null_count(), 1);
+            },
+            _ => panic!("unexpected data type")
+        );
+    }
+
+    #[test]
+    fn downcast_integer_array_should_not_match_primitive_that_are_not_integers() {
+        let array: ArrayRef = Arc::new(Float32Array::new_null(1));
+        let array_ref = &array;
+        downcast_integer_array!(
+            array_ref => {
+                panic!("unexpected data type {}", array_ref.data_type())
+            },
+            DataType::Float32 => {
+                assert_eq!(array_ref.null_count(), 1);
+            },
+            _ => panic!("unexpected data type")
+        );
+    }
+
+    #[test]
+    fn downcast_integer_array_should_not_match_non_primitive() {
+        let array: ArrayRef = Arc::new(StringArray::new_null(1));
+        let array_ref = &array;
+        downcast_integer_array!(
+            array_ref => {
+                panic!("unexpected data type {}", array_ref.data_type())
+            },
+            DataType::Utf8 => {
+                assert_eq!(array_ref.null_count(), 1);
+            },
+            _ => panic!("unexpected data type")
+        );
     }
 }

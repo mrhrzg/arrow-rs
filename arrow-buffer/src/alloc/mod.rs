@@ -15,105 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Defines memory-related functions, such as allocate/deallocate/reallocate memory
-//! regions, cache and allocation alignments.
+//! Defines the low-level [`Allocation`] API for shared memory regions
 
-use std::alloc::{handle_alloc_error, Layout};
+use std::alloc::Layout;
 use std::fmt::{Debug, Formatter};
 use std::panic::RefUnwindSafe;
-use std::ptr::NonNull;
 use std::sync::Arc;
 
 mod alignment;
 
 pub use alignment::ALIGNMENT;
-
-#[inline]
-unsafe fn null_pointer() -> NonNull<u8> {
-    NonNull::new_unchecked(ALIGNMENT as *mut u8)
-}
-
-/// Allocates a cache-aligned memory region of `size` bytes with uninitialized values.
-/// This is more performant than using [allocate_aligned_zeroed] when all bytes will have
-/// an unknown or non-zero value and is semantically similar to `malloc`.
-pub fn allocate_aligned(size: usize) -> NonNull<u8> {
-    unsafe {
-        if size == 0 {
-            null_pointer()
-        } else {
-            let layout = Layout::from_size_align_unchecked(size, ALIGNMENT);
-            let raw_ptr = std::alloc::alloc(layout);
-            NonNull::new(raw_ptr).unwrap_or_else(|| handle_alloc_error(layout))
-        }
-    }
-}
-
-/// Allocates a cache-aligned memory region of `size` bytes with `0` on all of them.
-/// This is more performant than using [allocate_aligned] and setting all bytes to zero
-/// and is semantically similar to `calloc`.
-pub fn allocate_aligned_zeroed(size: usize) -> NonNull<u8> {
-    unsafe {
-        if size == 0 {
-            null_pointer()
-        } else {
-            let layout = Layout::from_size_align_unchecked(size, ALIGNMENT);
-            let raw_ptr = std::alloc::alloc_zeroed(layout);
-            NonNull::new(raw_ptr).unwrap_or_else(|| handle_alloc_error(layout))
-        }
-    }
-}
-
-/// # Safety
-///
-/// This function is unsafe because undefined behavior can result if the caller does not ensure all
-/// of the following:
-///
-/// * ptr must denote a block of memory currently allocated via this allocator,
-///
-/// * size must be the same size that was used to allocate that block of memory,
-pub unsafe fn free_aligned(ptr: NonNull<u8>, size: usize) {
-    if ptr != null_pointer() {
-        std::alloc::dealloc(
-            ptr.as_ptr() as *mut u8,
-            Layout::from_size_align_unchecked(size, ALIGNMENT),
-        );
-    }
-}
-
-/// # Safety
-///
-/// This function is unsafe because undefined behavior can result if the caller does not ensure all
-/// of the following:
-///
-/// * ptr must be currently allocated via this allocator,
-///
-/// * new_size must be greater than zero.
-///
-/// * new_size, when rounded up to the nearest multiple of [ALIGNMENT], must not overflow (i.e.,
-/// the rounded value must be less than usize::MAX).
-pub unsafe fn reallocate(
-    ptr: NonNull<u8>,
-    old_size: usize,
-    new_size: usize,
-) -> NonNull<u8> {
-    if ptr == null_pointer() {
-        return allocate_aligned(new_size);
-    }
-
-    if new_size == 0 {
-        free_aligned(ptr, old_size);
-        return null_pointer();
-    }
-
-    let raw_ptr = std::alloc::realloc(
-        ptr.as_ptr() as *mut u8,
-        Layout::from_size_align_unchecked(old_size, ALIGNMENT),
-        new_size,
-    );
-    NonNull::new(raw_ptr).unwrap_or_else(|| {
-        handle_alloc_error(Layout::from_size_align_unchecked(new_size, ALIGNMENT))
-    })
-}
 
 /// The owner of an allocation.
 /// The trait implementation is responsible for dropping the allocations once no more references exist.
@@ -123,23 +34,37 @@ impl<T: RefUnwindSafe + Send + Sync> Allocation for T {}
 
 /// Mode of deallocating memory regions
 pub(crate) enum Deallocation {
-    /// An allocation of the given capacity that needs to be deallocated using arrows's cache aligned allocator.
-    /// See [allocate_aligned] and [free_aligned].
-    Arrow(usize),
-    /// An allocation from an external source like the FFI interface or a Rust Vec.
-    /// Deallocation will happen
-    Custom(Arc<dyn Allocation>),
+    /// An allocation using [`std::alloc`]
+    Standard(Layout),
+    /// An allocation from an external source like the FFI interface
+    /// Deallocation will happen on `Allocation::drop`
+    /// The size of the allocation is tracked here separately only
+    /// for memory usage reporting via `Array::get_buffer_memory_size`
+    Custom(Arc<dyn Allocation>, usize),
 }
 
 impl Debug for Deallocation {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
-            Deallocation::Arrow(capacity) => {
-                write!(f, "Deallocation::Arrow {{ capacity: {} }}", capacity)
+            Deallocation::Standard(layout) => {
+                write!(f, "Deallocation::Standard {layout:?}")
             }
-            Deallocation::Custom(_) => {
-                write!(f, "Deallocation::Custom {{ capacity: unknown }}")
+            Deallocation::Custom(_, size) => {
+                write!(f, "Deallocation::Custom {{ capacity: {size} }}")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::alloc::Deallocation;
+
+    #[test]
+    fn test_size_of_deallocation() {
+        assert_eq!(
+            std::mem::size_of::<Deallocation>(),
+            3 * std::mem::size_of::<usize>()
+        );
     }
 }

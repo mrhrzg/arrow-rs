@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{
-    data::{into_buffers, new_buffers},
-    ArrayData, ArrayDataBuilder,
-};
+//! Low-level array data abstractions.
+//!
+//! Provides utilities for creating, manipulating, and converting Arrow arrays
+//! made of primitive types, strings, and nested types.
+
+use super::{data::new_buffers, ArrayData, ArrayDataBuilder, ByteView};
 use crate::bit_mask::set_bits;
-use arrow_buffer::{bit_util, ArrowNativeType, MutableBuffer};
+use arrow_buffer::buffer::{BooleanBuffer, NullBuffer};
+use arrow_buffer::{bit_util, i256, ArrowNativeType, Buffer, MutableBuffer};
 use arrow_schema::{ArrowError, DataType, IntervalUnit, UnionMode};
 use half::f16;
 use num::Integer;
@@ -52,7 +55,7 @@ struct _MutableArrayData<'a> {
     pub null_count: usize,
 
     pub len: usize,
-    pub null_buffer: MutableBuffer,
+    pub null_buffer: Option<MutableBuffer>,
 
     // arrow specification only allows up to 3 buffers (2 ignoring the nulls above).
     // Thus, we place them in the stack to avoid bound checks and greater data locality.
@@ -61,51 +64,37 @@ struct _MutableArrayData<'a> {
     pub child_data: Vec<MutableArrayData<'a>>,
 }
 
-impl<'a> _MutableArrayData<'a> {
-    fn freeze(self, dictionary: Option<ArrayData>) -> ArrayDataBuilder {
-        let buffers = into_buffers(&self.data_type, self.buffer1, self.buffer2);
-
-        let child_data = match self.data_type {
-            DataType::Dictionary(_, _) => vec![dictionary.unwrap()],
-            _ => {
-                let mut child_data = Vec::with_capacity(self.child_data.len());
-                for child in self.child_data {
-                    child_data.push(child.freeze());
-                }
-                child_data
-            }
-        };
-
-        ArrayDataBuilder::new(self.data_type)
-            .offset(0)
-            .len(self.len)
-            .null_count(self.null_count)
-            .buffers(buffers)
-            .child_data(child_data)
-            .null_bit_buffer((self.null_count > 0).then(|| self.null_buffer.into()))
+impl _MutableArrayData<'_> {
+    fn null_buffer(&mut self) -> &mut MutableBuffer {
+        self.null_buffer
+            .as_mut()
+            .expect("MutableArrayData not nullable")
     }
 }
 
 fn build_extend_null_bits(array: &ArrayData, use_nulls: bool) -> ExtendNullBits {
-    if let Some(bitmap) = array.null_bitmap() {
-        let bytes = bitmap.buffer().as_slice();
+    if let Some(nulls) = array.nulls() {
+        let bytes = nulls.validity();
         Box::new(move |mutable, start, len| {
-            utils::resize_for_bits(&mut mutable.null_buffer, mutable.len + len);
+            let mutable_len = mutable.len;
+            let out = mutable.null_buffer();
+            utils::resize_for_bits(out, mutable_len + len);
             mutable.null_count += set_bits(
-                mutable.null_buffer.as_slice_mut(),
+                out.as_slice_mut(),
                 bytes,
-                mutable.len,
-                array.offset() + start,
+                mutable_len,
+                nulls.offset() + start,
                 len,
             );
         })
     } else if use_nulls {
         Box::new(|mutable, _, len| {
-            utils::resize_for_bits(&mut mutable.null_buffer, mutable.len + len);
-            let write_data = mutable.null_buffer.as_slice_mut();
-            let offset = mutable.len;
+            let mutable_len = mutable.len;
+            let out = mutable.null_buffer();
+            utils::resize_for_bits(out, mutable_len + len);
+            let write_data = out.as_slice_mut();
             (0..len).for_each(|i| {
-                bit_util::set_bit(write_data, offset + i);
+                bit_util::set_bit(write_data, mutable_len + i);
             });
         })
     } else {
@@ -113,38 +102,82 @@ fn build_extend_null_bits(array: &ArrayData, use_nulls: bool) -> ExtendNullBits 
     }
 }
 
-/// Struct to efficiently and interactively create an [ArrayData] from an existing [ArrayData] by
+/// Efficiently create an [ArrayData] from one or more existing [ArrayData]s by
 /// copying chunks.
 ///
-/// The main use case of this struct is to perform unary operations to arrays of arbitrary types,
-/// such as `filter` and `take`.
+/// The main use case of this struct is to perform unary operations to arrays of
+/// arbitrary types, such as `filter` and `take`.
+///
+/// # Example
+/// ```
+/// use arrow_buffer::Buffer;
+/// use arrow_data::ArrayData;
+/// use arrow_data::transform::MutableArrayData;
+/// use arrow_schema::DataType;
+/// fn i32_array(values: &[i32]) -> ArrayData {
+///   ArrayData::try_new(DataType::Int32, 5, None, 0, vec![Buffer::from_slice_ref(values)], vec![]).unwrap()
+/// }
+/// let arr1  = i32_array(&[1, 2, 3, 4, 5]);
+/// let arr2  = i32_array(&[6, 7, 8, 9, 10]);
+/// // Create a mutable array for copying values from arr1 and arr2, with a capacity for 6 elements
+/// let capacity = 3 * std::mem::size_of::<i32>();
+/// let mut mutable = MutableArrayData::new(vec![&arr1, &arr2], false, 10);
+/// // Copy the first 3 elements from arr1
+/// mutable.extend(0, 0, 3);
+/// // Copy the last 3 elements from arr2
+/// mutable.extend(1, 2, 4);
+/// // Complete the MutableArrayData into a new ArrayData
+/// let frozen = mutable.freeze();
+/// assert_eq!(frozen, i32_array(&[1, 2, 3, 8, 9, 10]));
+/// ```
 pub struct MutableArrayData<'a> {
+    /// Input arrays: the data being read FROM.
+    ///
+    /// Note this is "dead code" because all actual references to the arrays are
+    /// stored in closures for extending values and nulls.
     #[allow(dead_code)]
     arrays: Vec<&'a ArrayData>,
-    // The attributes in [_MutableArrayData] cannot be in [MutableArrayData] due to
-    // mutability invariants (interior mutability):
-    // [MutableArrayData] contains a function that can only mutate [_MutableArrayData], not
-    // [MutableArrayData] itself
+
+    /// In progress output array: The data being written TO
+    ///
+    /// Note these fields are in a separate struct, [_MutableArrayData], as they
+    /// cannot be in [MutableArrayData] itself due to mutability invariants (interior
+    /// mutability): [MutableArrayData] contains a function that can only mutate
+    /// [_MutableArrayData], not [MutableArrayData] itself
     data: _MutableArrayData<'a>,
 
-    // the child data of the `Array` in Dictionary arrays.
-    // This is not stored in `MutableArrayData` because these values constant and only needed
-    // at the end, when freezing [_MutableArrayData].
+    /// The child data of the `Array` in Dictionary arrays.
+    ///
+    /// This is not stored in `_MutableArrayData` because these values are
+    /// constant and only needed at the end, when freezing [_MutableArrayData].
     dictionary: Option<ArrayData>,
 
-    // function used to extend values from arrays. This function's lifetime is bound to the array
-    // because it reads values from it.
+    /// Variadic data buffers referenced by views.
+    ///
+    /// Note this this is not stored in `_MutableArrayData` because these values
+    /// are constant and only needed at the end, when freezing
+    /// [_MutableArrayData]
+    variadic_data_buffers: Vec<Buffer>,
+
+    /// function used to extend output array with values from input arrays.
+    ///
+    /// This function's lifetime is bound to the input arrays because it reads
+    /// values from them.
     extend_values: Vec<Extend<'a>>,
-    // function used to extend nulls from arrays. This function's lifetime is bound to the array
-    // because it reads nulls from it.
+
+    /// function used to extend the output array with nulls from input arrays.
+    ///
+    /// This function's lifetime is bound to the input arrays because it reads
+    /// nulls from it.
     extend_null_bits: Vec<ExtendNullBits<'a>>,
 
-    // function used to extend nulls.
-    // this is independent of the arrays and therefore has no lifetime.
+    /// function used to extend the output array with null elements.
+    ///
+    /// This function is independent of the arrays and therefore has no lifetime.
     extend_nulls: ExtendNulls,
 }
 
-impl<'a> std::fmt::Debug for MutableArrayData<'a> {
+impl std::fmt::Debug for MutableArrayData<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         // ignores the closures.
         f.debug_struct("MutableArrayData")
@@ -156,11 +189,7 @@ impl<'a> std::fmt::Debug for MutableArrayData<'a> {
 /// Builds an extend that adds `offset` to the source primitive
 /// Additionally validates that `max` fits into the
 /// the underlying primitive returning None if not
-fn build_extend_dictionary(
-    array: &ArrayData,
-    offset: usize,
-    max: usize,
-) -> Option<Extend> {
+fn build_extend_dictionary(array: &ArrayData, offset: usize, max: usize) -> Option<Extend> {
     macro_rules! validate_and_build {
         ($dt: ty) => {{
             let _: $dt = max.try_into().ok()?;
@@ -184,9 +213,28 @@ fn build_extend_dictionary(
     }
 }
 
+/// Builds an extend that adds `buffer_offset` to any buffer indices encountered
+fn build_extend_view(array: &ArrayData, buffer_offset: u32) -> Extend {
+    let views = array.buffer::<u128>(0);
+    Box::new(
+        move |mutable: &mut _MutableArrayData, _, start: usize, len: usize| {
+            mutable
+                .buffer1
+                .extend(views[start..start + len].iter().map(|v| {
+                    let len = *v as u32;
+                    if len <= 12 {
+                        return *v; // Stored inline
+                    }
+                    let mut view = ByteView::from(*v);
+                    view.buffer_index += buffer_offset;
+                    view.into()
+                }))
+        },
+    )
+}
+
 fn build_extend(array: &ArrayData) -> Extend {
     match array.data_type() {
-        DataType::Decimal128(_, _) => primitive::build_extend::<i128>(array),
         DataType::Null => null::build_extend(array),
         DataType::Boolean => boolean::build_extend(array),
         DataType::UInt8 => primitive::build_extend::<u8>(array),
@@ -199,44 +247,40 @@ fn build_extend(array: &ArrayData) -> Extend {
         DataType::Int64 => primitive::build_extend::<i64>(array),
         DataType::Float32 => primitive::build_extend::<f32>(array),
         DataType::Float64 => primitive::build_extend::<f64>(array),
-        DataType::Date32
-        | DataType::Time32(_)
-        | DataType::Interval(IntervalUnit::YearMonth) => {
+        DataType::Date32 | DataType::Time32(_) | DataType::Interval(IntervalUnit::YearMonth) => {
             primitive::build_extend::<i32>(array)
         }
         DataType::Date64
         | DataType::Time64(_)
         | DataType::Timestamp(_, _)
         | DataType::Duration(_)
-        | DataType::Interval(IntervalUnit::DayTime) => {
-            primitive::build_extend::<i64>(array)
-        }
-        DataType::Interval(IntervalUnit::MonthDayNano) => {
-            primitive::build_extend::<i128>(array)
-        }
+        | DataType::Interval(IntervalUnit::DayTime) => primitive::build_extend::<i64>(array),
+        DataType::Interval(IntervalUnit::MonthDayNano) => primitive::build_extend::<i128>(array),
+        DataType::Decimal128(_, _) => primitive::build_extend::<i128>(array),
+        DataType::Decimal256(_, _) => primitive::build_extend::<i256>(array),
         DataType::Utf8 | DataType::Binary => variable_size::build_extend::<i32>(array),
-        DataType::LargeUtf8 | DataType::LargeBinary => {
-            variable_size::build_extend::<i64>(array)
-        }
+        DataType::LargeUtf8 | DataType::LargeBinary => variable_size::build_extend::<i64>(array),
+        DataType::BinaryView | DataType::Utf8View => unreachable!("should use build_extend_view"),
         DataType::Map(_, _) | DataType::List(_) => list::build_extend::<i32>(array),
+        DataType::ListView(_) | DataType::LargeListView(_) => {
+            unimplemented!("ListView/LargeListView not implemented")
+        }
         DataType::LargeList(_) => list::build_extend::<i64>(array),
         DataType::Dictionary(_, _) => unreachable!("should use build_extend_dictionary"),
         DataType::Struct(_) => structure::build_extend(array),
-        DataType::FixedSizeBinary(_) | DataType::Decimal256(_, _) => {
-            fixed_binary::build_extend(array)
-        }
+        DataType::FixedSizeBinary(_) => fixed_binary::build_extend(array),
         DataType::Float16 => primitive::build_extend::<f16>(array),
         DataType::FixedSizeList(_, _) => fixed_size_list::build_extend(array),
-        DataType::Union(_, _, mode) => match mode {
+        DataType::Union(_, mode) => match mode {
             UnionMode::Sparse => union::build_extend_sparse(array),
             UnionMode::Dense => union::build_extend_dense(array),
         },
+        DataType::RunEndEncoded(_, _) => todo!(),
     }
 }
 
 fn build_extend_nulls(data_type: &DataType) -> ExtendNulls {
     Box::new(match data_type {
-        DataType::Decimal128(_, _) => primitive::extend_nulls::<i128>,
         DataType::Null => null::extend_nulls,
         DataType::Boolean => boolean::extend_nulls,
         DataType::UInt8 => primitive::extend_nulls::<u8>,
@@ -249,18 +293,24 @@ fn build_extend_nulls(data_type: &DataType) -> ExtendNulls {
         DataType::Int64 => primitive::extend_nulls::<i64>,
         DataType::Float32 => primitive::extend_nulls::<f32>,
         DataType::Float64 => primitive::extend_nulls::<f64>,
-        DataType::Date32
-        | DataType::Time32(_)
-        | DataType::Interval(IntervalUnit::YearMonth) => primitive::extend_nulls::<i32>,
+        DataType::Date32 | DataType::Time32(_) | DataType::Interval(IntervalUnit::YearMonth) => {
+            primitive::extend_nulls::<i32>
+        }
         DataType::Date64
         | DataType::Time64(_)
         | DataType::Timestamp(_, _)
         | DataType::Duration(_)
         | DataType::Interval(IntervalUnit::DayTime) => primitive::extend_nulls::<i64>,
         DataType::Interval(IntervalUnit::MonthDayNano) => primitive::extend_nulls::<i128>,
+        DataType::Decimal128(_, _) => primitive::extend_nulls::<i128>,
+        DataType::Decimal256(_, _) => primitive::extend_nulls::<i256>,
         DataType::Utf8 | DataType::Binary => variable_size::extend_nulls::<i32>,
         DataType::LargeUtf8 | DataType::LargeBinary => variable_size::extend_nulls::<i64>,
+        DataType::BinaryView | DataType::Utf8View => primitive::extend_nulls::<u128>,
         DataType::Map(_, _) | DataType::List(_) => list::extend_nulls::<i32>,
+        DataType::ListView(_) | DataType::LargeListView(_) => {
+            unimplemented!("ListView/LargeListView not implemented")
+        }
         DataType::LargeList(_) => list::extend_nulls::<i64>,
         DataType::Dictionary(child_data_type, _) => match child_data_type.as_ref() {
             DataType::UInt8 => primitive::extend_nulls::<u8>,
@@ -274,15 +324,14 @@ fn build_extend_nulls(data_type: &DataType) -> ExtendNulls {
             _ => unreachable!(),
         },
         DataType::Struct(_) => structure::extend_nulls,
-        DataType::FixedSizeBinary(_) | DataType::Decimal256(_, _) => {
-            fixed_binary::extend_nulls
-        }
+        DataType::FixedSizeBinary(_) => fixed_binary::extend_nulls,
         DataType::Float16 => primitive::extend_nulls::<f16>,
         DataType::FixedSizeList(_, _) => fixed_size_list::extend_nulls,
-        DataType::Union(_, _, mode) => match mode {
+        DataType::Union(_, mode) => match mode {
             UnionMode::Sparse => union::extend_nulls_sparse,
             UnionMode::Dense => union::extend_nulls_dense,
         },
+        DataType::RunEndEncoded(_, _) => todo!(),
     })
 }
 
@@ -301,53 +350,77 @@ fn preallocate_offset_and_binary_buffer<Offset: ArrowNativeType + Integer>(
     ]
 }
 
-/// Define capacities of child data or data buffers.
+/// Define capacities to pre-allocate for child data or data buffers.
 #[derive(Debug, Clone)]
 pub enum Capacities {
     /// Binary, Utf8 and LargeUtf8 data types
-    /// Define
+    ///
+    /// Defines
     /// * the capacity of the array offsets
     /// * the capacity of the binary/ str buffer
     Binary(usize, Option<usize>),
     /// List and LargeList data types
-    /// Define
+    ///
+    /// Defines
     /// * the capacity of the array offsets
     /// * the capacity of the child data
     List(usize, Option<Box<Capacities>>),
     /// Struct type
+    ///
+    /// Defines
     /// * the capacity of the array
     /// * the capacities of the fields
     Struct(usize, Option<Vec<Capacities>>),
     /// Dictionary type
+    ///
+    /// Defines
     /// * the capacity of the array/keys
     /// * the capacity of the values
     Dictionary(usize, Option<Box<Capacities>>),
     /// Don't preallocate inner buffers and rely on array growth strategy
     Array(usize),
 }
+
 impl<'a> MutableArrayData<'a> {
-    /// returns a new [MutableArrayData] with capacity to `capacity` slots and specialized to create an
-    /// [ArrayData] from multiple `arrays`.
+    /// Returns a new [MutableArrayData] with capacity to `capacity` slots and
+    /// specialized to create an [ArrayData] from multiple `arrays`.
     ///
-    /// `use_nulls` is a flag used to optimize insertions. It should be `false` if the only source of nulls
-    /// are the arrays themselves and `true` if the user plans to call [MutableArrayData::extend_nulls].
-    /// In other words, if `use_nulls` is `false`, calling [MutableArrayData::extend_nulls] should not be used.
+    /// # Arguments
+    /// * `arrays` - the source arrays to copy from
+    /// * `use_nulls` - a flag used to optimize insertions
+    ///   - `false` if the only source of nulls are the arrays themselves
+    ///   - `true` if the user plans to call [MutableArrayData::extend_nulls].
+    /// * capacity - the preallocated capacity of the output array, in bytes
+    ///
+    /// Thus, if `use_nulls` is `false`, calling
+    /// [MutableArrayData::extend_nulls] should not be used.
     pub fn new(arrays: Vec<&'a ArrayData>, use_nulls: bool, capacity: usize) -> Self {
         Self::with_capacities(arrays, use_nulls, Capacities::Array(capacity))
     }
 
-    /// Similar to [MutableArrayData::new], but lets users define the preallocated capacities of the array.
-    /// See also [MutableArrayData::new] for more information on the arguments.
+    /// Similar to [MutableArrayData::new], but lets users define the
+    /// preallocated capacities of the array with more granularity.
     ///
-    /// # Panic
-    /// This function panics if the given `capacities` don't match the data type of `arrays`. Or when
-    /// a [Capacities] variant is not yet supported.
+    /// See [MutableArrayData::new] for more information on the arguments.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the given `capacities` don't match the data type
+    /// of `arrays`. Or when a [Capacities] variant is not yet supported.
     pub fn with_capacities(
         arrays: Vec<&'a ArrayData>,
         use_nulls: bool,
         capacities: Capacities,
     ) -> Self {
         let data_type = arrays[0].data_type();
+
+        for a in arrays.iter().skip(1) {
+            assert_eq!(
+                data_type,
+                a.data_type(),
+                "Arrays with inconsistent types passed to MutableArrayData"
+            )
+        }
 
         // if any of the arrays has nulls, insertions from any array requires setting bits
         // as there is at least one array with nulls.
@@ -363,10 +436,7 @@ impl<'a> MutableArrayData<'a> {
                 array_capacity = *capacity;
                 preallocate_offset_and_binary_buffer::<i64>(*capacity, *value_cap)
             }
-            (
-                DataType::Utf8 | DataType::Binary,
-                Capacities::Binary(capacity, Some(value_cap)),
-            ) => {
+            (DataType::Utf8 | DataType::Binary, Capacities::Binary(capacity, Some(value_cap))) => {
                 array_capacity = *capacity;
                 preallocate_offset_and_binary_buffer::<i32>(*capacity, *value_cap)
             }
@@ -375,13 +445,13 @@ impl<'a> MutableArrayData<'a> {
                 new_buffers(data_type, *capacity)
             }
             (
-                DataType::List(_) | DataType::LargeList(_),
+                DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _),
                 Capacities::List(capacity, _),
             ) => {
                 array_capacity = *capacity;
                 new_buffers(data_type, *capacity)
             }
-            _ => panic!("Capacities: {:?} not yet supported", capacities),
+            _ => panic!("Capacities: {capacities:?} not yet supported"),
         };
 
         let child_data = match &data_type {
@@ -410,27 +480,31 @@ impl<'a> MutableArrayData<'a> {
             | DataType::Binary
             | DataType::LargeUtf8
             | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::Utf8View
             | DataType::Interval(_)
             | DataType::FixedSizeBinary(_) => vec![],
+            DataType::ListView(_) | DataType::LargeListView(_) => {
+                unimplemented!("ListView/LargeListView not implemented")
+            }
             DataType::Map(_, _) | DataType::List(_) | DataType::LargeList(_) => {
-                let childs = arrays
+                let children = arrays
                     .iter()
                     .map(|array| &array.child_data()[0])
                     .collect::<Vec<_>>();
 
-                let capacities = if let Capacities::List(capacity, ref child_capacities) =
-                    capacities
-                {
-                    child_capacities
-                        .clone()
-                        .map(|c| *c)
-                        .unwrap_or(Capacities::Array(capacity))
-                } else {
-                    Capacities::Array(array_capacity)
-                };
+                let capacities =
+                    if let Capacities::List(capacity, ref child_capacities) = capacities {
+                        child_capacities
+                            .clone()
+                            .map(|c| *c)
+                            .unwrap_or(Capacities::Array(capacity))
+                    } else {
+                        Capacities::Array(array_capacity)
+                    };
 
                 vec![MutableArrayData::with_capacities(
-                    childs, use_nulls, capacities,
+                    children, use_nulls, capacities,
                 )]
             }
             // the dictionary type just appends keys and clones the values.
@@ -475,14 +549,39 @@ impl<'a> MutableArrayData<'a> {
                     })
                     .collect::<Vec<_>>(),
             },
-            DataType::FixedSizeList(_, _) => {
-                let childs = arrays
+            DataType::RunEndEncoded(_, _) => {
+                let run_ends_child = arrays
                     .iter()
                     .map(|array| &array.child_data()[0])
                     .collect::<Vec<_>>();
-                vec![MutableArrayData::new(childs, use_nulls, array_capacity)]
+                let value_child = arrays
+                    .iter()
+                    .map(|array| &array.child_data()[1])
+                    .collect::<Vec<_>>();
+                vec![
+                    MutableArrayData::new(run_ends_child, false, array_capacity),
+                    MutableArrayData::new(value_child, use_nulls, array_capacity),
+                ]
             }
-            DataType::Union(fields, _, _) => (0..fields.len())
+            DataType::FixedSizeList(_, size) => {
+                let children = arrays
+                    .iter()
+                    .map(|array| &array.child_data()[0])
+                    .collect::<Vec<_>>();
+                let capacities =
+                    if let Capacities::List(capacity, ref child_capacities) = capacities {
+                        child_capacities
+                            .clone()
+                            .map(|c| *c)
+                            .unwrap_or(Capacities::Array(capacity * *size as usize))
+                    } else {
+                        Capacities::Array(array_capacity * *size as usize)
+                    };
+                vec![MutableArrayData::with_capacities(
+                    children, use_nulls, capacities,
+                )]
+            }
+            DataType::Union(fields, _) => (0..fields.len())
                 .map(|i| {
                     let child_arrays = arrays
                         .iter()
@@ -515,8 +614,7 @@ impl<'a> MutableArrayData<'a> {
                             .collect();
                         let capacity = lengths.iter().sum();
 
-                        let mut mutable =
-                            MutableArrayData::new(dictionaries, false, capacity);
+                        let mut mutable = MutableArrayData::new(dictionaries, false, capacity);
 
                         for (i, len) in lengths.iter().enumerate() {
                             mutable.extend(i, 0, *len)
@@ -529,6 +627,15 @@ impl<'a> MutableArrayData<'a> {
             _ => (None, false),
         };
 
+        let variadic_data_buffers = match &data_type {
+            DataType::BinaryView | DataType::Utf8View => arrays
+                .iter()
+                .flat_map(|x| x.buffers().iter().skip(1))
+                .map(Buffer::clone)
+                .collect(),
+            _ => vec![],
+        };
+
         let extend_nulls = build_extend_nulls(data_type);
 
         let extend_null_bits = arrays
@@ -536,13 +643,10 @@ impl<'a> MutableArrayData<'a> {
             .map(|array| build_extend_null_bits(array, use_nulls))
             .collect();
 
-        let null_buffer = if use_nulls {
+        let null_buffer = use_nulls.then(|| {
             let null_bytes = bit_util::ceil(array_capacity, 8);
             MutableBuffer::from_len_zeroed(null_bytes)
-        } else {
-            // create 0 capacity mutable buffer with the intention that it won't be used
-            MutableBuffer::with_capacity(0)
-        };
+        });
 
         let extend_values = match &data_type {
             DataType::Dictionary(_, _) => {
@@ -564,6 +668,20 @@ impl<'a> MutableArrayData<'a> {
 
                 extend_values.expect("MutableArrayData::new is infallible")
             }
+            DataType::BinaryView | DataType::Utf8View => {
+                let mut next_offset = 0u32;
+                arrays
+                    .iter()
+                    .map(|arr| {
+                        let num_data_buffers = (arr.buffers().len() - 1) as u32;
+                        let offset = next_offset;
+                        next_offset = next_offset
+                            .checked_add(num_data_buffers)
+                            .expect("view buffer index overflow");
+                        build_extend_view(arr, offset)
+                    })
+                    .collect()
+            }
             _ => arrays.iter().map(|array| build_extend(array)).collect(),
         };
 
@@ -580,13 +698,14 @@ impl<'a> MutableArrayData<'a> {
             arrays,
             data,
             dictionary,
+            variadic_data_buffers,
             extend_values,
             extend_null_bits,
             extend_nulls,
         }
     }
 
-    /// Extends this array with a chunk of its source arrays
+    /// Extends the in progress array with a region of the input arrays
     ///
     /// # Arguments
     /// * `index` - the index of array that you what to copy values from
@@ -604,14 +723,18 @@ impl<'a> MutableArrayData<'a> {
         self.data.len += len;
     }
 
-    /// Extends this [MutableArrayData] with null elements, disregarding the bound arrays
+    /// Extends the in progress array with null elements, ignoring the input arrays.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`MutableArrayData`] not created with `use_nulls` or nullable source arrays
     pub fn extend_nulls(&mut self, len: usize) {
-        // TODO: null_buffer should probably be extended here as well
-        // otherwise is_valid() could later panic
-        // add test to confirm
+        self.data.len += len;
+        let bit_len = bit_util::ceil(self.data.len, 8);
+        let nulls = self.data.null_buffer();
+        nulls.resize(bit_len, 0);
         self.data.null_count += len;
         (self.extend_nulls)(&mut self.data, len);
-        self.data.len += len;
     }
 
     /// Returns the current length
@@ -632,15 +755,58 @@ impl<'a> MutableArrayData<'a> {
         self.data.null_count
     }
 
-    /// Creates a [ArrayData] from the pushed regions up to this point, consuming `self`.
+    /// Creates a [ArrayData] from the in progress array, consuming `self`.
     pub fn freeze(self) -> ArrayData {
-        unsafe { self.data.freeze(self.dictionary).build_unchecked() }
+        unsafe { self.into_builder().build_unchecked() }
     }
 
-    /// Creates a [ArrayDataBuilder] from the pushed regions up to this point, consuming `self`.
+    /// Consume self and returns the in progress array as [`ArrayDataBuilder`].
+    ///
     /// This is useful for extending the default behavior of MutableArrayData.
     pub fn into_builder(self) -> ArrayDataBuilder {
-        self.data.freeze(self.dictionary)
+        let data = self.data;
+
+        let buffers = match data.data_type {
+            DataType::Null | DataType::Struct(_) | DataType::FixedSizeList(_, _) => {
+                vec![]
+            }
+            DataType::BinaryView | DataType::Utf8View => {
+                let mut b = self.variadic_data_buffers;
+                b.insert(0, data.buffer1.into());
+                b
+            }
+            DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => {
+                vec![data.buffer1.into(), data.buffer2.into()]
+            }
+            DataType::Union(_, mode) => {
+                match mode {
+                    // Based on Union's DataTypeLayout
+                    UnionMode::Sparse => vec![data.buffer1.into()],
+                    UnionMode::Dense => vec![data.buffer1.into(), data.buffer2.into()],
+                }
+            }
+            _ => vec![data.buffer1.into()],
+        };
+
+        let child_data = match data.data_type {
+            DataType::Dictionary(_, _) => vec![self.dictionary.unwrap()],
+            _ => data.child_data.into_iter().map(|x| x.freeze()).collect(),
+        };
+
+        let nulls = data
+            .null_buffer
+            .map(|nulls| {
+                let bools = BooleanBuffer::new(nulls.into(), 0, data.len);
+                unsafe { NullBuffer::new_unchecked(bools, data.null_count) }
+            })
+            .filter(|n| n.null_count() > 0);
+
+        ArrayDataBuilder::new(data.data_type)
+            .offset(0)
+            .len(data.len)
+            .nulls(nulls)
+            .buffers(buffers)
+            .child_data(child_data)
     }
 }
 
@@ -650,10 +816,11 @@ impl<'a> MutableArrayData<'a> {
 mod test {
     use super::*;
     use arrow_schema::Field;
+    use std::sync::Arc;
 
     #[test]
     fn test_list_append_with_capacities() {
-        let array = ArrayData::new_empty(&DataType::List(Box::new(Field::new(
+        let array = ArrayData::new_empty(&DataType::List(Arc::new(Field::new(
             "element",
             DataType::Int64,
             false,

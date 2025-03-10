@@ -25,7 +25,7 @@ extern crate arrow;
 use arrow::array::*;
 use arrow_buffer::i256;
 use rand::Rng;
-use std::{convert::TryFrom, sync::Arc};
+use std::sync::Arc;
 
 fn array_from_vec(n: usize) {
     let v: Vec<i32> = (0..n as i32).collect();
@@ -70,9 +70,7 @@ fn struct_array_from_vec(
     let strings: ArrayRef = Arc::new(StringArray::from(strings.to_owned()));
     let ints: ArrayRef = Arc::new(Int32Array::from(ints.to_owned()));
 
-    criterion::black_box(
-        StructArray::try_from(vec![(field1, strings), (field2, ints)]).unwrap(),
-    );
+    criterion::black_box(StructArray::try_from(vec![(field1, strings), (field2, ints)]).unwrap());
 }
 
 fn decimal128_array_from_vec(array: &[Option<i128>]) {

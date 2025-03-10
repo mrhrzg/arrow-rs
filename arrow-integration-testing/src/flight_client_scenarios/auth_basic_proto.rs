@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Scenario for testing basic auth.
+
 use crate::{AUTH_PASSWORD, AUTH_USERNAME};
 
-use arrow_flight::{
-    flight_service_client::FlightServiceClient, BasicAuth, HandshakeRequest,
-};
+use arrow_flight::{flight_service_client::FlightServiceClient, BasicAuth, HandshakeRequest};
 use futures::{stream, StreamExt};
 use prost::Message;
 use tonic::{metadata::MetadataValue, Request, Status};
@@ -29,8 +29,9 @@ type Result<T = (), E = Error> = std::result::Result<T, E>;
 
 type Client = FlightServiceClient<tonic::transport::Channel>;
 
+/// Run a scenario that tests basic auth.
 pub async fn run_scenario(host: &str, port: u16) -> Result {
-    let url = format!("http://{}:{}", host, port);
+    let url = format!("http://{host}:{port}");
     let mut client = FlightServiceClient::connect(url).await?;
 
     let action = arrow_flight::Action::default();
@@ -41,15 +42,13 @@ pub async fn run_scenario(host: &str, port: u16) -> Result {
         Err(e) => {
             if e.code() != tonic::Code::Unauthenticated {
                 return Err(Box::new(Status::internal(format!(
-                    "Expected UNAUTHENTICATED but got {:?}",
-                    e
+                    "Expected UNAUTHENTICATED but got {e:?}"
                 ))));
             }
         }
         Ok(other) => {
             return Err(Box::new(Status::internal(format!(
-                "Expected UNAUTHENTICATED but got {:?}",
-                other
+                "Expected UNAUTHENTICATED but got {other:?}"
             ))));
         }
     }
@@ -74,17 +73,13 @@ pub async fn run_scenario(host: &str, port: u16) -> Result {
         .expect("No response received")
         .expect("Invalid response received");
 
-    let body = String::from_utf8(r.body).unwrap();
+    let body = std::str::from_utf8(&r.body).unwrap();
     assert_eq!(body, AUTH_USERNAME);
 
     Ok(())
 }
 
-async fn authenticate(
-    client: &mut Client,
-    username: &str,
-    password: &str,
-) -> Result<String> {
+async fn authenticate(client: &mut Client, username: &str, password: &str) -> Result<String> {
     let auth = BasicAuth {
         username: username.into(),
         password: password.into(),
@@ -94,7 +89,7 @@ async fn authenticate(
 
     let req = stream::once(async {
         HandshakeRequest {
-            payload,
+            payload: payload.into(),
             ..HandshakeRequest::default()
         }
     });
@@ -105,5 +100,5 @@ async fn authenticate(
     let r = rx.next().await.expect("must respond from handshake")?;
     assert!(rx.next().await.is_none(), "must not respond a second time");
 
-    Ok(String::from_utf8(r.payload).unwrap())
+    Ok(std::str::from_utf8(&r.payload).unwrap().into())
 }

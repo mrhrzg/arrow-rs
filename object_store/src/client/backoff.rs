@@ -18,7 +18,12 @@
 use rand::prelude::*;
 use std::time::Duration;
 
-/// Exponential backoff with jitter
+/// Exponential backoff with decorrelated jitter algorithm
+///
+/// The first backoff will always be `init_backoff`.
+///
+/// Subsequent backoffs will pick a random value between `init_backoff` and
+/// `base * previous` where `previous` is the duration of the previous backoff
 ///
 /// See <https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/>
 #[allow(missing_copy_implementations)]
@@ -28,7 +33,7 @@ pub struct BackoffConfig {
     pub init_backoff: Duration,
     /// The maximum backoff duration
     pub max_backoff: Duration,
-    /// The base of the exponential to use
+    /// The multiplier to use for the next backoff duration
     pub base: f64,
 }
 
@@ -46,7 +51,7 @@ impl Default for BackoffConfig {
 ///
 /// Consecutive calls to [`Backoff::next`] will return the next backoff interval
 ///
-pub struct Backoff {
+pub(crate) struct Backoff {
     init_backoff: f64,
     next_backoff_secs: f64,
     max_backoff_secs: f64,
@@ -67,14 +72,14 @@ impl std::fmt::Debug for Backoff {
 
 impl Backoff {
     /// Create a new [`Backoff`] from the provided [`BackoffConfig`]
-    pub fn new(config: &BackoffConfig) -> Self {
+    pub(crate) fn new(config: &BackoffConfig) -> Self {
         Self::new_with_rng(config, None)
     }
 
     /// Creates a new `Backoff` with the optional `rng`
     ///
     /// Used [`rand::thread_rng()`] if no rng provided
-    pub fn new_with_rng(
+    pub(crate) fn new_with_rng(
         config: &BackoffConfig,
         rng: Option<Box<dyn RngCore + Sync + Send>>,
     ) -> Self {
@@ -89,7 +94,7 @@ impl Backoff {
     }
 
     /// Returns the next backoff duration to wait for
-    pub fn next(&mut self) -> Duration {
+    pub(crate) fn next(&mut self) -> Duration {
         let range = self.init_backoff..(self.next_backoff_secs * self.base);
 
         let rand_backoff = match self.rng.as_mut() {
@@ -98,10 +103,7 @@ impl Backoff {
         };
 
         let next_backoff = self.max_backoff_secs.min(rand_backoff);
-        Duration::from_secs_f64(std::mem::replace(
-            &mut self.next_backoff_secs,
-            next_backoff,
-        ))
+        Duration::from_secs_f64(std::mem::replace(&mut self.next_backoff_secs, next_backoff))
     }
 }
 
@@ -122,8 +124,7 @@ mod tests {
             base,
         };
 
-        let assert_fuzzy_eq =
-            |a: f64, b: f64| assert!((b - a).abs() < 0.0001, "{} != {}", a, b);
+        let assert_fuzzy_eq = |a: f64, b: f64| assert!((b - a).abs() < 0.0001, "{a} != {b}");
 
         // Create a static rng that takes the minimum of the range
         let rng = Box::new(StepRng::new(0, 0));
@@ -149,8 +150,8 @@ mod tests {
         let mut value = init_backoff_secs;
         for _ in 0..20 {
             assert_fuzzy_eq(backoff.next().as_secs_f64(), value);
-            value = (init_backoff_secs + (value * base - init_backoff_secs) / 2.)
-                .min(max_backoff_secs);
+            value =
+                (init_backoff_secs + (value * base - init_backoff_secs) / 2.).min(max_backoff_secs);
         }
     }
 }

@@ -18,27 +18,25 @@
 use arrow::array::{
     make_array, Array, ArrayRef, BooleanArray, Decimal128Array, FixedSizeBinaryArray,
     FixedSizeBinaryBuilder, FixedSizeListBuilder, GenericBinaryArray, GenericStringArray,
-    Int32Array, Int32Builder, Int64Builder, ListArray, ListBuilder, NullArray,
-    OffsetSizeTrait, StringArray, StringDictionaryBuilder, StructArray, UnionBuilder,
+    Int32Array, Int32Builder, Int64Builder, ListArray, ListBuilder, NullArray, OffsetSizeTrait,
+    StringArray, StringDictionaryBuilder, StructArray, UnionBuilder,
 };
 use arrow::datatypes::{Int16Type, Int32Type};
-use arrow_array::builder::{StringBuilder, StructBuilder};
+use arrow_array::builder::{StringBuilder, StringViewBuilder, StructBuilder};
+use arrow_array::{DictionaryArray, FixedSizeListArray, StringViewArray};
 use arrow_buffer::{Buffer, ToByteSlice};
 use arrow_data::{ArrayData, ArrayDataBuilder};
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Fields};
 use std::sync::Arc;
 
 #[test]
 fn test_null_equal() {
     let a = NullArray::new(12);
-    let a = a.data();
     let b = NullArray::new(12);
-    let b = b.data();
-    test_equal(a, b, true);
+    test_equal(&a, &b, true);
 
     let b = NullArray::new(10);
-    let b = b.data();
-    test_equal(a, b, false);
+    test_equal(&a, &b, false);
 
     // Test the case where offset != 0
 
@@ -54,69 +52,53 @@ fn test_null_equal() {
 #[test]
 fn test_boolean_equal() {
     let a = BooleanArray::from(vec![false, false, true]);
-    let a = a.data();
     let b = BooleanArray::from(vec![false, false, true]);
-    let b = b.data();
-    test_equal(a, b, true);
+    test_equal(&a, &b, true);
 
     let b = BooleanArray::from(vec![false, false, false]);
-    let b = b.data();
-    test_equal(a, b, false);
+    test_equal(&a, &b, false);
 }
 
 #[test]
 fn test_boolean_equal_nulls() {
     let a = BooleanArray::from(vec![Some(false), None, None, Some(true)]);
-    let a = a.data();
     let b = BooleanArray::from(vec![Some(false), None, None, Some(true)]);
-    let b = b.data();
-    test_equal(a, b, true);
+    test_equal(&a, &b, true);
 
     let b = BooleanArray::from(vec![None, None, None, Some(true)]);
-    let b = b.data();
-    test_equal(a, b, false);
+    test_equal(&a, &b, false);
 
     let b = BooleanArray::from(vec![Some(true), None, None, Some(true)]);
-    let b = b.data();
-    test_equal(a, b, false);
+    test_equal(&a, &b, false);
 }
 
 #[test]
 fn test_boolean_equal_offset() {
     let a = BooleanArray::from(vec![false, true, false, true, false, false, true]);
-    let a = a.data();
     let b = BooleanArray::from(vec![true, false, false, false, true, false, true, true]);
-    let b = b.data();
-    assert_ne!(a, b);
-    assert_ne!(b, a);
+    test_equal(&a, &b, false);
 
     let a_slice = a.slice(2, 3);
     let b_slice = b.slice(3, 3);
-    assert_eq!(a_slice, b_slice);
-    assert_eq!(b_slice, a_slice);
+    test_equal(&a_slice, &b_slice, true);
 
     let a_slice = a.slice(3, 4);
     let b_slice = b.slice(4, 4);
-    assert_ne!(a_slice, b_slice);
-    assert_ne!(b_slice, a_slice);
+    test_equal(&a_slice, &b_slice, false);
 
     // Test the optimization cases where null_count == 0 and starts at 0 and len >= size_of(u8)
 
     // Elements fill in `u8`'s exactly.
     let mut vector = vec![false, false, true, true, true, true, true, true];
     let a = BooleanArray::from(vector.clone());
-    let a = a.data();
     let b = BooleanArray::from(vector.clone());
-    let b = b.data();
-    test_equal(a, b, true);
+    test_equal(&a, &b, true);
 
     // Elements fill in `u8`s + suffix bits.
     vector.push(true);
     let a = BooleanArray::from(vector.clone());
-    let a = a.data();
     let b = BooleanArray::from(vector);
-    let b = b.data();
-    test_equal(a, b, true);
+    test_equal(&a, &b, true);
 }
 
 #[test]
@@ -151,10 +133,8 @@ fn test_primitive() {
 
     for (lhs, rhs, expected) in cases {
         let lhs = Int32Array::from(lhs);
-        let lhs = lhs.data();
         let rhs = Int32Array::from(rhs);
-        let rhs = rhs.data();
-        test_equal(lhs, rhs, expected);
+        test_equal(&lhs, &rhs, expected);
     }
 }
 
@@ -207,10 +187,8 @@ fn test_primitive_slice() {
 
     for (lhs, slice_lhs, rhs, slice_rhs, expected) in cases {
         let lhs = Int32Array::from(lhs);
-        let lhs = lhs.data();
         let lhs = lhs.slice(slice_lhs.0, slice_lhs.1);
         let rhs = Int32Array::from(rhs);
-        let rhs = rhs.data();
         let rhs = rhs.slice(slice_rhs.0, slice_rhs.1);
 
         test_equal(&lhs, &rhs, expected);
@@ -218,7 +196,7 @@ fn test_primitive_slice() {
 }
 
 #[allow(clippy::eq_op)]
-fn test_equal(lhs: &ArrayData, rhs: &ArrayData, expected: bool) {
+fn test_equal(lhs: &dyn Array, rhs: &dyn Array, expected: bool) {
     // equality is symmetric
     assert_eq!(lhs, lhs);
     assert_eq!(rhs, rhs);
@@ -275,10 +253,8 @@ fn test_generic_string_equal<OffsetSize: OffsetSizeTrait>() {
 
     for (lhs, rhs, expected) in cases {
         let lhs: GenericStringArray<OffsetSize> = lhs.into_iter().collect();
-        let lhs = lhs.data();
         let rhs: GenericStringArray<OffsetSize> = rhs.into_iter().collect();
-        let rhs = rhs.data();
-        test_equal(lhs, rhs, expected);
+        test_equal(&lhs, &rhs, expected);
     }
 }
 
@@ -305,10 +281,8 @@ fn test_generic_binary_equal<OffsetSize: OffsetSizeTrait>() {
             .map(|x| x.as_deref().map(|x| x.as_bytes()))
             .collect();
         let lhs = GenericBinaryArray::<OffsetSize>::from_opt_vec(lhs);
-        let lhs = lhs.data();
         let rhs = GenericBinaryArray::<OffsetSize>::from_opt_vec(rhs);
-        let rhs = rhs.data();
-        test_equal(lhs, rhs, expected);
+        test_equal(&lhs, &rhs, expected);
     }
 }
 
@@ -326,32 +300,70 @@ fn test_large_binary_equal() {
 fn test_fixed_size_binary_array() {
     let a_input_arg = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
     let a = FixedSizeBinaryArray::try_from_iter(a_input_arg.into_iter()).unwrap();
-    let a = a.data();
 
     let b_input_arg = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
     let b = FixedSizeBinaryArray::try_from_iter(b_input_arg.into_iter()).unwrap();
-    let b = b.data();
 
-    test_equal(a, b, true);
+    test_equal(&a, &b, true);
+}
+
+#[test]
+fn test_string_view_equal() {
+    let a1 = StringViewArray::from(vec!["foo", "very long string over 12 bytes", "bar"]);
+    let a2 = StringViewArray::from(vec![
+        "a very long string over 12 bytes",
+        "foo",
+        "very long string over 12 bytes",
+        "bar",
+    ]);
+    test_equal(&a1, &a2.slice(1, 3), true);
+
+    let a1 = StringViewArray::from(vec!["foo", "very long string over 12 bytes", "bar"]);
+    let a2 = StringViewArray::from(vec!["foo", "very long string over 12 bytes", "bar"]);
+    test_equal(&a1, &a2, true);
+
+    let a1_s = a1.slice(1, 1);
+    let a2_s = a2.slice(1, 1);
+    test_equal(&a1_s, &a2_s, true);
+
+    let a1_s = a1.slice(2, 1);
+    let a2_s = a2.slice(0, 1);
+    test_equal(&a1_s, &a2_s, false);
+
+    // test will null value.
+    let a1 = StringViewArray::from(vec!["foo", "very long string over 12 bytes", "bar"]);
+    let a2 = {
+        let mut builder = StringViewBuilder::new();
+        builder.append_value("foo");
+        builder.append_null();
+        builder.append_option(Some("very long string over 12 bytes"));
+        builder.append_value("bar");
+        builder.finish()
+    };
+    test_equal(&a1, &a2, false);
+
+    let a1_s = a1.slice(1, 2);
+    let a2_s = a2.slice(1, 3);
+    test_equal(&a1_s, &a2_s, false);
+
+    let a1_s = a1.slice(1, 2);
+    let a2_s = a2.slice(2, 2);
+    test_equal(&a1_s, &a2_s, true);
 }
 
 #[test]
 fn test_string_offset() {
     let a = StringArray::from(vec![Some("a"), None, Some("b")]);
-    let a = a.data();
     let a = a.slice(2, 1);
     let b = StringArray::from(vec![Some("b")]);
-    let b = b.data();
 
-    test_equal(&a, b, true);
+    test_equal(&a, &b, true);
 }
 
 #[test]
 fn test_string_offset_larger() {
     let a = StringArray::from(vec![Some("a"), None, Some("b"), None, Some("c")]);
-    let a = a.data();
     let b = StringArray::from(vec![None, Some("b"), None, Some("c")]);
-    let b = b.data();
 
     test_equal(&a.slice(2, 2), &b.slice(0, 2), false);
     test_equal(&a.slice(2, 2), &b.slice(1, 2), true);
@@ -361,17 +373,14 @@ fn test_string_offset_larger() {
 #[test]
 fn test_null() {
     let a = NullArray::new(2);
-    let a = a.data();
     let b = NullArray::new(2);
-    let b = b.data();
-    test_equal(a, b, true);
+    test_equal(&a, &b, true);
 
     let b = NullArray::new(1);
-    let b = b.data();
-    test_equal(a, b, false);
+    test_equal(&a, &b, false);
 }
 
-fn create_list_array<U: AsRef<[i32]>, T: AsRef<[Option<U>]>>(data: T) -> ArrayData {
+fn create_list_array<U: AsRef<[i32]>, T: AsRef<[Option<U>]>>(data: T) -> ListArray {
     let mut builder = ListBuilder::new(Int32Builder::with_capacity(10));
     for d in data.as_ref() {
         if let Some(v) = d {
@@ -381,7 +390,7 @@ fn create_list_array<U: AsRef<[i32]>, T: AsRef<[Option<U>]>>(data: T) -> ArrayDa
             builder.append(false);
         }
     }
-    builder.finish().into_data()
+    builder.finish()
 }
 
 #[test]
@@ -400,47 +409,43 @@ fn test_empty_offsets_list_equal() {
     let values = Int32Array::from(empty);
     let empty_offsets: [u8; 0] = [];
 
-    let a = ArrayDataBuilder::new(DataType::List(Box::new(Field::new(
-        "item",
+    let a: ListArray = ArrayDataBuilder::new(DataType::List(Arc::new(Field::new_list_field(
         DataType::Int32,
         true,
     ))))
     .len(0)
     .add_buffer(Buffer::from(&empty_offsets))
-    .add_child_data(values.data().clone())
+    .add_child_data(values.to_data())
     .null_bit_buffer(Some(Buffer::from(&empty_offsets)))
     .build()
-    .unwrap();
+    .unwrap()
+    .into();
 
-    let b = ArrayDataBuilder::new(DataType::List(Box::new(Field::new(
-        "item",
+    let b: ListArray = ArrayDataBuilder::new(DataType::List(Arc::new(Field::new_list_field(
         DataType::Int32,
         true,
     ))))
     .len(0)
     .add_buffer(Buffer::from(&empty_offsets))
-    .add_child_data(values.data().clone())
+    .add_child_data(values.to_data())
     .null_bit_buffer(Some(Buffer::from(&empty_offsets)))
     .build()
-    .unwrap();
+    .unwrap()
+    .into();
 
     test_equal(&a, &b, true);
 
-    let c = ArrayDataBuilder::new(DataType::List(Box::new(Field::new(
-        "item",
+    let c: ListArray = ArrayDataBuilder::new(DataType::List(Arc::new(Field::new_list_field(
         DataType::Int32,
         true,
     ))))
     .len(0)
-    .add_buffer(Buffer::from(vec![0i32, 2, 3, 4, 6, 7, 8].to_byte_slice()))
-    .add_child_data(
-        Int32Array::from(vec![1, 2, -1, -2, 3, 4, -3, -4])
-            .data()
-            .clone(),
-    )
-    .null_bit_buffer(Some(Buffer::from(vec![0b00001001])))
+    .add_buffer(Buffer::from([0i32, 2, 3, 4, 6, 7, 8].to_byte_slice()))
+    .add_child_data(Int32Array::from(vec![1, 2, -1, -2, 3, 4, -3, -4]).into_data())
+    .null_bit_buffer(Some(Buffer::from([0b00001001])))
     .build()
-    .unwrap();
+    .unwrap()
+    .into();
 
     test_equal(&a, &c, true);
 }
@@ -467,17 +472,17 @@ fn test_list_null() {
 
     // a list where the nullness of values is determined by the list's bitmap
     let c_values = Int32Array::from(vec![1, 2, -1, -2, 3, 4, -3, -4]);
-    let c = ArrayDataBuilder::new(DataType::List(Box::new(Field::new(
-        "item",
+    let c: ListArray = ArrayDataBuilder::new(DataType::List(Arc::new(Field::new_list_field(
         DataType::Int32,
         true,
     ))))
     .len(6)
-    .add_buffer(Buffer::from(vec![0i32, 2, 3, 4, 6, 7, 8].to_byte_slice()))
+    .add_buffer(Buffer::from([0i32, 2, 3, 4, 6, 7, 8].to_byte_slice()))
     .add_child_data(c_values.into_data())
-    .null_bit_buffer(Some(Buffer::from(vec![0b00001001])))
+    .null_bit_buffer(Some(Buffer::from([0b00001001])))
     .build()
-    .unwrap();
+    .unwrap()
+    .into();
 
     let d_values = Int32Array::from(vec![
         Some(1),
@@ -489,17 +494,17 @@ fn test_list_null() {
         None,
         None,
     ]);
-    let d = ArrayDataBuilder::new(DataType::List(Box::new(Field::new(
-        "item",
+    let d: ListArray = ArrayDataBuilder::new(DataType::List(Arc::new(Field::new_list_field(
         DataType::Int32,
         true,
     ))))
     .len(6)
-    .add_buffer(Buffer::from(vec![0i32, 2, 3, 4, 6, 7, 8].to_byte_slice()))
+    .add_buffer(Buffer::from([0i32, 2, 3, 4, 6, 7, 8].to_byte_slice()))
     .add_child_data(d_values.into_data())
-    .null_bit_buffer(Some(Buffer::from(vec![0b00001001])))
+    .null_bit_buffer(Some(Buffer::from([0b00001001])))
     .build()
-    .unwrap();
+    .unwrap()
+    .into();
     test_equal(&c, &d, true);
 }
 
@@ -524,7 +529,7 @@ fn test_list_offsets() {
 
 fn create_fixed_size_binary_array<U: AsRef<[u8]>, T: AsRef<[Option<U>]>>(
     data: T,
-) -> ArrayData {
+) -> FixedSizeBinaryArray {
     let mut builder = FixedSizeBinaryBuilder::with_capacity(data.as_ref().len(), 5);
 
     for d in data.as_ref() {
@@ -534,7 +539,7 @@ fn create_fixed_size_binary_array<U: AsRef<[u8]>, T: AsRef<[Option<U>]>>(
             builder.append_null();
         }
     }
-    builder.finish().into_data()
+    builder.finish()
 }
 
 #[test]
@@ -564,22 +569,10 @@ fn test_fixed_size_binary_null() {
 #[test]
 fn test_fixed_size_binary_offsets() {
     // Test the case where offset != 0
-    let a = create_fixed_size_binary_array([
-        Some(b"hello"),
-        None,
-        None,
-        Some(b"world"),
-        None,
-        None,
-    ]);
-    let b = create_fixed_size_binary_array([
-        Some(b"hello"),
-        None,
-        None,
-        Some(b"arrow"),
-        None,
-        None,
-    ]);
+    let a =
+        create_fixed_size_binary_array([Some(b"hello"), None, None, Some(b"world"), None, None]);
+    let b =
+        create_fixed_size_binary_array([Some(b"hello"), None, None, Some(b"arrow"), None, None]);
 
     let a_slice = a.slice(0, 3);
     let b_slice = b.slice(0, 3);
@@ -598,12 +591,11 @@ fn test_fixed_size_binary_offsets() {
     test_equal(&a_slice, &b_slice, false);
 }
 
-fn create_decimal_array(data: Vec<Option<i128>>) -> ArrayData {
+fn create_decimal_array(data: Vec<Option<i128>>) -> Decimal128Array {
     data.into_iter()
         .collect::<Decimal128Array>()
         .with_precision_and_scale(23, 6)
         .unwrap()
-        .into()
 }
 
 #[test]
@@ -687,7 +679,7 @@ fn test_decimal_offsets() {
 /// Create a fixed size list of 2 value lengths
 fn create_fixed_size_list_array<U: AsRef<[i32]>, T: AsRef<[Option<U>]>>(
     data: T,
-) -> ArrayData {
+) -> FixedSizeListArray {
     let mut builder = FixedSizeListBuilder::new(Int32Builder::with_capacity(10), 3);
 
     for d in data.as_ref() {
@@ -701,7 +693,7 @@ fn create_fixed_size_list_array<U: AsRef<[i32]>, T: AsRef<[Option<U>]>>(
             builder.append(false);
         }
     }
-    builder.finish().into_data()
+    builder.finish()
 }
 
 #[test]
@@ -717,22 +709,10 @@ fn test_fixed_size_list_equal() {
 // Test the case where null_count > 0
 #[test]
 fn test_fixed_list_null() {
-    let a = create_fixed_size_list_array([
-        Some(&[1, 2, 3]),
-        None,
-        None,
-        Some(&[4, 5, 6]),
-        None,
-        None,
-    ]);
-    let b = create_fixed_size_list_array([
-        Some(&[1, 2, 3]),
-        None,
-        None,
-        Some(&[4, 5, 6]),
-        None,
-        None,
-    ]);
+    let a =
+        create_fixed_size_list_array([Some(&[1, 2, 3]), None, None, Some(&[4, 5, 6]), None, None]);
+    let b =
+        create_fixed_size_list_array([Some(&[1, 2, 3]), None, None, Some(&[4, 5, 6]), None, None]);
     test_equal(&a, &b, true);
 
     let b = create_fixed_size_list_array([
@@ -745,14 +725,8 @@ fn test_fixed_list_null() {
     ]);
     test_equal(&a, &b, false);
 
-    let b = create_fixed_size_list_array([
-        Some(&[1, 2, 3]),
-        None,
-        None,
-        Some(&[3, 6, 9]),
-        None,
-        None,
-    ]);
+    let b =
+        create_fixed_size_list_array([Some(&[1, 2, 3]), None, None, Some(&[3, 6, 9]), None, None]);
     test_equal(&a, &b, false);
 
     let b = create_fixed_size_list_array([None, Some(&[4, 5, 6]), None, None]);
@@ -764,22 +738,10 @@ fn test_fixed_list_null() {
 #[test]
 fn test_fixed_list_offsets() {
     // Test the case where offset != 0
-    let a = create_fixed_size_list_array([
-        Some(&[1, 2, 3]),
-        None,
-        None,
-        Some(&[4, 5, 6]),
-        None,
-        None,
-    ]);
-    let b = create_fixed_size_list_array([
-        Some(&[1, 2, 3]),
-        None,
-        None,
-        Some(&[3, 6, 9]),
-        None,
-        None,
-    ]);
+    let a =
+        create_fixed_size_list_array([Some(&[1, 2, 3]), None, None, Some(&[4, 5, 6]), None, None]);
+    let b =
+        create_fixed_size_list_array([Some(&[1, 2, 3]), None, None, Some(&[3, 6, 9]), None, None]);
 
     let a_slice = a.slice(0, 3);
     let b_slice = b.slice(0, 3);
@@ -811,14 +773,11 @@ fn test_struct_equal() {
         Some(5),
     ]));
 
-    let a = StructArray::try_from(vec![("f1", strings.clone()), ("f2", ints.clone())])
-        .unwrap();
-    let a = a.data();
+    let a = StructArray::try_from(vec![("f1", strings.clone()), ("f2", ints.clone())]).unwrap();
 
     let b = StructArray::try_from(vec![("f1", strings), ("f2", ints)]).unwrap();
-    let b = b.data();
 
-    test_equal(a, b, true);
+    test_equal(&a, &b, true);
 }
 
 #[test]
@@ -839,57 +798,55 @@ fn test_struct_equal_null() {
     ]));
     let ints_non_null: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 0]));
 
-    let a = ArrayData::builder(DataType::Struct(vec![
+    let a = ArrayData::builder(DataType::Struct(Fields::from(vec![
         Field::new("f1", DataType::Utf8, true),
         Field::new("f2", DataType::Int32, true),
-    ]))
-    .null_bit_buffer(Some(Buffer::from(vec![0b00001011])))
+    ])))
+    .null_bit_buffer(Some(Buffer::from([0b00001011])))
     .len(5)
-    .add_child_data(strings.data_ref().clone())
-    .add_child_data(ints.data_ref().clone())
+    .add_child_data(strings.to_data())
+    .add_child_data(ints.to_data())
     .build()
     .unwrap();
     let a = make_array(a);
 
-    let b = ArrayData::builder(DataType::Struct(vec![
+    let b = ArrayData::builder(DataType::Struct(Fields::from(vec![
         Field::new("f1", DataType::Utf8, true),
         Field::new("f2", DataType::Int32, true),
-    ]))
-    .null_bit_buffer(Some(Buffer::from(vec![0b00001011])))
+    ])))
+    .null_bit_buffer(Some(Buffer::from([0b00001011])))
     .len(5)
-    .add_child_data(strings.data_ref().clone())
-    .add_child_data(ints_non_null.data_ref().clone())
+    .add_child_data(strings.to_data())
+    .add_child_data(ints_non_null.to_data())
     .build()
     .unwrap();
     let b = make_array(b);
 
-    test_equal(a.data_ref(), b.data_ref(), true);
+    test_equal(&a, &b, true);
 
     // test with arrays that are not equal
     let c_ints_non_null: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 0, 4]));
-    let c = ArrayData::builder(DataType::Struct(vec![
+    let c = ArrayData::builder(DataType::Struct(Fields::from(vec![
         Field::new("f1", DataType::Utf8, true),
         Field::new("f2", DataType::Int32, true),
-    ]))
-    .null_bit_buffer(Some(Buffer::from(vec![0b00001011])))
+    ])))
+    .null_bit_buffer(Some(Buffer::from([0b00001011])))
     .len(5)
-    .add_child_data(strings.data_ref().clone())
-    .add_child_data(c_ints_non_null.data_ref().clone())
+    .add_child_data(strings.to_data())
+    .add_child_data(c_ints_non_null.to_data())
     .build()
     .unwrap();
     let c = make_array(c);
 
-    test_equal(a.data_ref(), c.data_ref(), false);
+    test_equal(&a, &c, false);
 
     // test a nested struct
-    let a = ArrayData::builder(DataType::Struct(vec![Field::new(
-        "f3",
-        a.data_type().clone(),
-        true,
-    )]))
-    .null_bit_buffer(Some(Buffer::from(vec![0b00011110])))
+    let a = ArrayData::builder(DataType::Struct(
+        vec![Field::new("f3", a.data_type().clone(), true)].into(),
+    ))
+    .null_bit_buffer(Some(Buffer::from([0b00011110])))
     .len(5)
-    .add_child_data(a.data_ref().clone())
+    .add_child_data(a.to_data())
     .build()
     .unwrap();
     let a = make_array(a);
@@ -902,30 +859,28 @@ fn test_struct_equal_null() {
         Some("mark"),
         Some("doe"),
     ]));
-    let b = ArrayData::builder(DataType::Struct(vec![
+    let b = ArrayData::builder(DataType::Struct(Fields::from(vec![
         Field::new("f1", DataType::Utf8, true),
         Field::new("f2", DataType::Int32, true),
-    ]))
-    .null_bit_buffer(Some(Buffer::from(vec![0b00001011])))
+    ])))
+    .null_bit_buffer(Some(Buffer::from([0b00001011])))
     .len(5)
-    .add_child_data(strings.data_ref().clone())
-    .add_child_data(ints_non_null.data_ref().clone())
+    .add_child_data(strings.to_data())
+    .add_child_data(ints_non_null.to_data())
     .build()
     .unwrap();
 
-    let b = ArrayData::builder(DataType::Struct(vec![Field::new(
-        "f3",
-        b.data_type().clone(),
-        true,
-    )]))
-    .null_bit_buffer(Some(Buffer::from(vec![0b00011110])))
+    let b = ArrayData::builder(DataType::Struct(
+        vec![Field::new("f3", b.data_type().clone(), true)].into(),
+    ))
+    .null_bit_buffer(Some(Buffer::from([0b00011110])))
     .len(5)
     .add_child_data(b)
     .build()
     .unwrap();
     let b = make_array(b);
 
-    test_equal(a.data_ref(), b.data_ref(), true);
+    test_equal(&a, &b, true);
 }
 
 #[test]
@@ -946,31 +901,27 @@ fn test_struct_equal_null_variable_size() {
         Some("doe"),
     ]));
 
-    let a = ArrayData::builder(DataType::Struct(vec![Field::new(
-        "f1",
-        DataType::Utf8,
-        true,
-    )]))
-    .null_bit_buffer(Some(Buffer::from(vec![0b00001010])))
+    let a = ArrayData::builder(DataType::Struct(
+        vec![Field::new("f1", DataType::Utf8, true)].into(),
+    ))
+    .null_bit_buffer(Some(Buffer::from([0b00001010])))
     .len(5)
-    .add_child_data(strings1.data_ref().clone())
+    .add_child_data(strings1.to_data())
     .build()
     .unwrap();
     let a = make_array(a);
 
-    let b = ArrayData::builder(DataType::Struct(vec![Field::new(
-        "f1",
-        DataType::Utf8,
-        true,
-    )]))
-    .null_bit_buffer(Some(Buffer::from(vec![0b00001010])))
+    let b = ArrayData::builder(DataType::Struct(
+        vec![Field::new("f1", DataType::Utf8, true)].into(),
+    ))
+    .null_bit_buffer(Some(Buffer::from([0b00001010])))
     .len(5)
-    .add_child_data(strings2.data_ref().clone())
+    .add_child_data(strings2.to_data())
     .build()
     .unwrap();
     let b = make_array(b);
 
-    test_equal(a.data_ref(), b.data_ref(), true);
+    test_equal(&a, &b, true);
 
     // test with arrays that are not equal
     let strings3: ArrayRef = Arc::new(StringArray::from(vec![
@@ -980,26 +931,23 @@ fn test_struct_equal_null_variable_size() {
         Some("doe"),
         Some("joe"),
     ]));
-    let c = ArrayData::builder(DataType::Struct(vec![Field::new(
-        "f1",
-        DataType::Utf8,
-        true,
-    )]))
-    .null_bit_buffer(Some(Buffer::from(vec![0b00001011])))
+    let c = ArrayData::builder(DataType::Struct(
+        vec![Field::new("f1", DataType::Utf8, true)].into(),
+    ))
+    .null_bit_buffer(Some(Buffer::from([0b00001011])))
     .len(5)
-    .add_child_data(strings3.data_ref().clone())
+    .add_child_data(strings3.to_data())
     .build()
     .unwrap();
     let c = make_array(c);
 
-    test_equal(a.data_ref(), c.data_ref(), false);
+    test_equal(&a, &c, false);
 }
 
-fn create_dictionary_array(values: &[&str], keys: &[Option<&str>]) -> ArrayData {
+fn create_dictionary_array(values: &[&str], keys: &[Option<&str>]) -> DictionaryArray<Int16Type> {
     let values = StringArray::from(values.to_vec());
     let mut builder =
-        StringDictionaryBuilder::<Int16Type>::new_with_dictionary(keys.len(), &values)
-            .unwrap();
+        StringDictionaryBuilder::<Int16Type>::new_with_dictionary(keys.len(), &values).unwrap();
     for key in keys {
         if let Some(v) = key {
             builder.append(v).unwrap();
@@ -1007,7 +955,7 @@ fn create_dictionary_array(values: &[&str], keys: &[Option<&str>]) -> ArrayData 
             builder.append_null()
         }
     }
-    builder.finish().into_data()
+    builder.finish()
 }
 
 #[test]
@@ -1046,75 +994,48 @@ fn test_dictionary_equal() {
 #[test]
 fn test_dictionary_equal_null() {
     // (a, b, c), (1, 2, 1, 3) => (a, b, a, c)
-    let a = create_dictionary_array(
-        &["a", "b", "c"],
-        &[Some("a"), None, Some("a"), Some("c")],
-    );
+    let a = create_dictionary_array(&["a", "b", "c"], &[Some("a"), None, Some("a"), Some("c")]);
 
     // equal to self
     test_equal(&a, &a, true);
 
     // different representation (values and keys are swapped), same result
-    let b = create_dictionary_array(
-        &["a", "c", "b"],
-        &[Some("a"), None, Some("a"), Some("c")],
-    );
+    let b = create_dictionary_array(&["a", "c", "b"], &[Some("a"), None, Some("a"), Some("c")]);
     test_equal(&a, &b, true);
 
     // different null position
-    let b = create_dictionary_array(
-        &["a", "c", "b"],
-        &[Some("a"), Some("b"), Some("a"), None],
-    );
+    let b = create_dictionary_array(&["a", "c", "b"], &[Some("a"), Some("b"), Some("a"), None]);
     test_equal(&a, &b, false);
 
     // different key
-    let b = create_dictionary_array(
-        &["a", "c", "b"],
-        &[Some("a"), None, Some("a"), Some("a")],
-    );
+    let b = create_dictionary_array(&["a", "c", "b"], &[Some("a"), None, Some("a"), Some("a")]);
     test_equal(&a, &b, false);
 
     // different values, same keys
-    let b = create_dictionary_array(
-        &["a", "b", "d"],
-        &[Some("a"), None, Some("a"), Some("d")],
-    );
+    let b = create_dictionary_array(&["a", "b", "d"], &[Some("a"), None, Some("a"), Some("d")]);
     test_equal(&a, &b, false);
 }
 
 #[test]
 fn test_non_null_empty_strings() {
-    let s = StringArray::from(vec![Some(""), Some(""), Some("")]);
+    let s1 = StringArray::from(vec![Some(""), Some(""), Some("")]);
+    let data = s1.to_data().into_builder().nulls(None).build().unwrap();
+    let s2 = StringArray::from(data);
 
-    let string1 = s.data();
-
-    let string2 = ArrayData::builder(DataType::Utf8)
-        .len(string1.len())
-        .buffers(string1.buffers().to_vec())
-        .build()
-        .unwrap();
-
-    // string2 is identical to string1 except that it has no validity buffer but since there
-    // are no nulls, string1 and string2 are equal
-    test_equal(string1, &string2, true);
+    // s2 is identical to s1 except that it has no validity buffer but since there
+    // are no nulls, s1 and s2 are equal
+    test_equal(&s1, &s2, true);
 }
 
 #[test]
 fn test_null_empty_strings() {
-    let s = StringArray::from(vec![Some(""), None, Some("")]);
+    let s1 = StringArray::from(vec![Some(""), None, Some("")]);
+    let data = s1.to_data().into_builder().nulls(None).build().unwrap();
+    let s2 = StringArray::from(data);
 
-    let string1 = s.data();
-
-    let string2 = ArrayData::builder(DataType::Utf8)
-        .len(string1.len())
-        .buffers(string1.buffers().to_vec())
-        .build()
-        .unwrap();
-
-    // string2 is identical to string1 except that it has no validity buffer since string1 has
-    // nulls in it, string1 and string2 are not equal
-    test_equal(string1, &string2, false);
+    // s2 is identical to s1 except that it has no validity buffer since string1 has
+    // nulls in it, s1 and s2 are not equal
+    test_equal(&s1, &s2, false);
 }
 
 #[test]
@@ -1159,9 +1080,9 @@ fn test_union_equal_dense() {
     builder.append::<Int32Type>("b", 7).unwrap();
     let union4 = builder.build().unwrap();
 
-    test_equal(union1.data(), union2.data(), true);
-    test_equal(union1.data(), union3.data(), false);
-    test_equal(union1.data(), union4.data(), false);
+    test_equal(&union1, &union2, true);
+    test_equal(&union1, &union3, false);
+    test_equal(&union1, &union4, false);
 }
 
 #[test]
@@ -1206,22 +1127,38 @@ fn test_union_equal_sparse() {
     builder.append::<Int32Type>("b", 7).unwrap();
     let union4 = builder.build().unwrap();
 
-    test_equal(union1.data(), union2.data(), true);
-    test_equal(union1.data(), union3.data(), false);
-    test_equal(union1.data(), union4.data(), false);
+    test_equal(&union1, &union2, true);
+    test_equal(&union1, &union3, false);
+    test_equal(&union1, &union4, false);
+}
+
+#[test]
+fn test_union_equal_sparse_slice() {
+    let mut builder = UnionBuilder::new_sparse();
+    builder.append::<Int32Type>("a", 1).unwrap();
+    builder.append::<Int32Type>("a", 2).unwrap();
+    builder.append::<Int32Type>("b", 3).unwrap();
+    let a1 = builder.build().unwrap();
+
+    let mut builder = UnionBuilder::new_sparse();
+    builder.append::<Int32Type>("a", 2).unwrap();
+    builder.append::<Int32Type>("b", 3).unwrap();
+    let a2 = builder.build().unwrap();
+
+    test_equal(&a1.slice(1, 2), &a2, true)
 }
 
 #[test]
 fn test_boolean_slice() {
     let array = BooleanArray::from(vec![true; 32]);
     let slice = array.slice(4, 12);
-    assert_eq!(slice.data(), slice.data());
+    assert_eq!(&slice, &slice);
 
     let slice = array.slice(8, 12);
-    assert_eq!(slice.data(), slice.data());
+    assert_eq!(&slice, &slice);
 
     let slice = array.slice(8, 24);
-    assert_eq!(slice.data(), slice.data());
+    assert_eq!(&slice, &slice);
 }
 
 #[test]
@@ -1230,7 +1167,7 @@ fn test_sliced_nullable_boolean_array() {
     let b = BooleanArray::from(vec![true; 32]);
     let slice_a = a.slice(1, 12);
     let slice_b = b.slice(1, 12);
-    assert_ne!(slice_a.data(), slice_b.data());
+    assert_ne!(&slice_a, &slice_b);
 }
 
 #[test]
@@ -1274,9 +1211,7 @@ fn test_list_different_offsets() {
     assert_eq!(&a_slice, &b_slice);
 }
 
-fn make_struct(
-    elements: Vec<Option<(Option<&'static str>, Option<i32>)>>,
-) -> StructArray {
+fn make_struct(elements: Vec<Option<(Option<&'static str>, Option<i32>)>>) -> StructArray {
     let mut builder = StructBuilder::new(
         vec![
             Field::new("f1", DataType::Utf8, true),
@@ -1333,5 +1268,27 @@ fn test_struct_equal_slice() {
     ]);
     assert_eq!(a, &b);
 
-    test_equal(a.data(), b.data(), true);
+    test_equal(&a, &b, true);
+}
+
+#[test]
+fn test_list_excess_children_equal() {
+    let mut a = ListBuilder::new(FixedSizeBinaryBuilder::new(5));
+    a.values().append_value(b"11111").unwrap(); // Masked value
+    a.append_null();
+    a.values().append_value(b"22222").unwrap();
+    a.values().append_null();
+    a.append(true);
+    let a = a.finish();
+
+    let mut b = ListBuilder::new(FixedSizeBinaryBuilder::new(5));
+    b.append_null();
+    b.values().append_value(b"22222").unwrap();
+    b.values().append_null();
+    b.append(true);
+    let b = b.finish();
+
+    assert_eq!(a.value_offsets(), &[0, 1, 3]);
+    assert_eq!(b.value_offsets(), &[0, 0, 2]);
+    assert_eq!(a, b);
 }

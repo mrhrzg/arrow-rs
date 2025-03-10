@@ -121,28 +121,76 @@ impl CodecOptionsBuilder {
     }
 }
 
+/// Defines valid compression levels.
+pub(crate) trait CompressionLevel<T: std::fmt::Display + std::cmp::PartialOrd> {
+    const MINIMUM_LEVEL: T;
+    const MAXIMUM_LEVEL: T;
+
+    /// Tests if the provided compression level is valid.
+    fn is_valid_level(level: T) -> Result<()> {
+        let compression_range = Self::MINIMUM_LEVEL..=Self::MAXIMUM_LEVEL;
+        if compression_range.contains(&level) {
+            Ok(())
+        } else {
+            Err(ParquetError::General(format!(
+                "valid compression range {}..={} exceeded.",
+                compression_range.start(),
+                compression_range.end()
+            )))
+        }
+    }
+}
+
 /// Given the compression type `codec`, returns a codec used to compress and decompress
 /// bytes for the compression type.
 /// This returns `None` if the codec type is `UNCOMPRESSED`.
-pub fn create_codec(
-    codec: CodecType,
-    options: &CodecOptions,
-) -> Result<Option<Box<dyn Codec>>> {
+pub fn create_codec(codec: CodecType, _options: &CodecOptions) -> Result<Option<Box<dyn Codec>>> {
+    #[allow(unreachable_code, unused_variables)]
     match codec {
-        #[cfg(any(feature = "brotli", test))]
-        CodecType::BROTLI => Ok(Some(Box::new(BrotliCodec::new()))),
-        #[cfg(any(feature = "flate2", test))]
-        CodecType::GZIP => Ok(Some(Box::new(GZipCodec::new()))),
-        #[cfg(any(feature = "snap", test))]
-        CodecType::SNAPPY => Ok(Some(Box::new(SnappyCodec::new()))),
-        #[cfg(any(feature = "lz4", test))]
-        CodecType::LZ4 => Ok(Some(Box::new(LZ4HadoopCodec::new(
-            options.backward_compatible_lz4,
-        )))),
-        #[cfg(any(feature = "zstd", test))]
-        CodecType::ZSTD => Ok(Some(Box::new(ZSTDCodec::new()))),
-        #[cfg(any(feature = "lz4", test))]
-        CodecType::LZ4_RAW => Ok(Some(Box::new(LZ4RawCodec::new()))),
+        CodecType::BROTLI(level) => {
+            #[cfg(any(feature = "brotli", test))]
+            return Ok(Some(Box::new(BrotliCodec::new(level))));
+            Err(ParquetError::General(
+                "Disabled feature at compile time: brotli".into(),
+            ))
+        }
+        CodecType::GZIP(level) => {
+            #[cfg(any(feature = "flate2", test))]
+            return Ok(Some(Box::new(GZipCodec::new(level))));
+            Err(ParquetError::General(
+                "Disabled feature at compile time: flate2".into(),
+            ))
+        }
+        CodecType::SNAPPY => {
+            #[cfg(any(feature = "snap", test))]
+            return Ok(Some(Box::new(SnappyCodec::new())));
+            Err(ParquetError::General(
+                "Disabled feature at compile time: snap".into(),
+            ))
+        }
+        CodecType::LZ4 => {
+            #[cfg(any(feature = "lz4", test))]
+            return Ok(Some(Box::new(LZ4HadoopCodec::new(
+                _options.backward_compatible_lz4,
+            ))));
+            Err(ParquetError::General(
+                "Disabled feature at compile time: lz4".into(),
+            ))
+        }
+        CodecType::ZSTD(level) => {
+            #[cfg(any(feature = "zstd", test))]
+            return Ok(Some(Box::new(ZSTDCodec::new(level))));
+            Err(ParquetError::General(
+                "Disabled feature at compile time: zstd".into(),
+            ))
+        }
+        CodecType::LZ4_RAW => {
+            #[cfg(any(feature = "lz4", test))]
+            return Ok(Some(Box::new(LZ4RawCodec::new())));
+            Err(ParquetError::General(
+                "Disabled feature at compile time: lz4".into(),
+            ))
+        }
         CodecType::UNCOMPRESSED => Ok(None),
         _ => Err(nyi_err!("The codec type {} is not supported yet", codec)),
     }
@@ -214,13 +262,17 @@ mod gzip_codec {
     use crate::compression::Codec;
     use crate::errors::Result;
 
+    use super::GzipLevel;
+
     /// Codec for GZIP compression algorithm.
-    pub struct GZipCodec {}
+    pub struct GZipCodec {
+        level: GzipLevel,
+    }
 
     impl GZipCodec {
         /// Creates new GZIP compression codec.
-        pub(crate) fn new() -> Self {
-            Self {}
+        pub(crate) fn new(level: GzipLevel) -> Self {
+            Self { level }
         }
     }
 
@@ -231,12 +283,12 @@ mod gzip_codec {
             output_buf: &mut Vec<u8>,
             _uncompress_size: Option<usize>,
         ) -> Result<usize> {
-            let mut decoder = read::GzDecoder::new(input_buf);
+            let mut decoder = read::MultiGzDecoder::new(input_buf);
             decoder.read_to_end(output_buf).map_err(|e| e.into())
         }
 
         fn compress(&mut self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
-            let mut encoder = write::GzEncoder::new(output_buf, Compression::default());
+            let mut encoder = write::GzEncoder::new(output_buf, Compression::new(self.level.0));
             encoder.write_all(input_buf)?;
             encoder.try_finish().map_err(|e| e.into())
         }
@@ -244,6 +296,66 @@ mod gzip_codec {
 }
 #[cfg(any(feature = "flate2", test))]
 pub use gzip_codec::*;
+
+/// Represents a valid gzip compression level.
+///
+/// Defaults to 6.
+///
+/// * 0: least compression
+/// * 9: most compression (that other software can read)
+/// * 10: most compression (incompatible with other software, see below)
+/// #### WARNING:
+/// Level 10 compression can offer smallest file size,
+/// but Parquet files created with it will not be readable
+/// by other "standard" paquet readers.
+///
+/// Do **NOT** use level 10 if you need other software to
+/// be able to read the files. Read below for details.
+///
+/// ### IMPORTANT:
+/// There's often confusion about the compression levels in `flate2` vs `arrow`
+/// as highlighted in issue [#1011](https://github.com/apache/arrow-rs/issues/6282).
+///
+/// `flate2` supports two compression backends: `miniz_oxide` and `zlib`.
+///
+/// - `zlib` supports levels from 0 to 9.
+/// - `miniz_oxide` supports levels from 0 to 10.
+///
+/// `arrow` uses `flate` with `rust_backend` feature,
+/// which provides `miniz_oxide` as the backend.
+/// Therefore 0-10 levels are supported.
+///
+/// `flate2` documents this behavior properly with
+/// [this commit](https://github.com/rust-lang/flate2-rs/pull/430).
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
+pub struct GzipLevel(u32);
+
+impl Default for GzipLevel {
+    fn default() -> Self {
+        // The default as of miniz_oxide 0.5.1 is 6 for compression level
+        // (miniz_oxide::deflate::CompressionLevel::DefaultLevel)
+        Self(6)
+    }
+}
+
+impl CompressionLevel<u32> for GzipLevel {
+    const MINIMUM_LEVEL: u32 = 0;
+    const MAXIMUM_LEVEL: u32 = 10;
+}
+
+impl GzipLevel {
+    /// Attempts to create a gzip compression level.
+    ///
+    /// Compression levels must be valid (i.e. be acceptable for [`flate2::Compression`]).
+    pub fn try_new(level: u32) -> Result<Self> {
+        Self::is_valid_level(level).map(|_| Self(level))
+    }
+
+    /// Returns the compression level.
+    pub fn compression_level(&self) -> u32 {
+        self.0
+    }
+}
 
 #[cfg(any(feature = "brotli", test))]
 mod brotli_codec {
@@ -253,17 +365,20 @@ mod brotli_codec {
     use crate::compression::Codec;
     use crate::errors::Result;
 
+    use super::BrotliLevel;
+
     const BROTLI_DEFAULT_BUFFER_SIZE: usize = 4096;
-    const BROTLI_DEFAULT_COMPRESSION_QUALITY: u32 = 1; // supported levels 0-9
     const BROTLI_DEFAULT_LG_WINDOW_SIZE: u32 = 22; // recommended between 20-22
 
     /// Codec for Brotli compression algorithm.
-    pub struct BrotliCodec {}
+    pub struct BrotliCodec {
+        level: BrotliLevel,
+    }
 
     impl BrotliCodec {
         /// Creates new Brotli compression codec.
-        pub(crate) fn new() -> Self {
-            Self {}
+        pub(crate) fn new(level: BrotliLevel) -> Self {
+            Self { level }
         }
     }
 
@@ -284,7 +399,7 @@ mod brotli_codec {
             let mut encoder = brotli::CompressorWriter::new(
                 output_buf,
                 BROTLI_DEFAULT_BUFFER_SIZE,
-                BROTLI_DEFAULT_COMPRESSION_QUALITY,
+                self.level.0,
                 BROTLI_DEFAULT_LG_WINDOW_SIZE,
             );
             encoder.write_all(input_buf)?;
@@ -295,12 +410,41 @@ mod brotli_codec {
 #[cfg(any(feature = "brotli", test))]
 pub use brotli_codec::*;
 
+/// Represents a valid brotli compression level.
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
+pub struct BrotliLevel(u32);
+
+impl Default for BrotliLevel {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+impl CompressionLevel<u32> for BrotliLevel {
+    const MINIMUM_LEVEL: u32 = 0;
+    const MAXIMUM_LEVEL: u32 = 11;
+}
+
+impl BrotliLevel {
+    /// Attempts to create a brotli compression level.
+    ///
+    /// Compression levels must be valid.
+    pub fn try_new(level: u32) -> Result<Self> {
+        Self::is_valid_level(level).map(|_| Self(level))
+    }
+
+    /// Returns the compression level.
+    pub fn compression_level(&self) -> u32 {
+        self.0
+    }
+}
+
 #[cfg(any(feature = "lz4", test))]
 mod lz4_codec {
     use std::io::{Read, Write};
 
     use crate::compression::Codec;
-    use crate::errors::Result;
+    use crate::errors::{ParquetError, Result};
 
     const LZ4_BUFFER_SIZE: usize = 4096;
 
@@ -321,7 +465,7 @@ mod lz4_codec {
             output_buf: &mut Vec<u8>,
             _uncompress_size: Option<usize>,
         ) -> Result<usize> {
-            let mut decoder = lz4::Decoder::new(input_buf)?;
+            let mut decoder = lz4_flex::frame::FrameDecoder::new(input_buf);
             let mut buffer: [u8; LZ4_BUFFER_SIZE] = [0; LZ4_BUFFER_SIZE];
             let mut total_len = 0;
             loop {
@@ -336,7 +480,7 @@ mod lz4_codec {
         }
 
         fn compress(&mut self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
-            let mut encoder = lz4::EncoderBuilder::new().build(output_buf)?;
+            let mut encoder = lz4_flex::frame::FrameEncoder::new(output_buf);
             let mut from = 0;
             loop {
                 let to = std::cmp::min(from + LZ4_BUFFER_SIZE, input_buf.len());
@@ -346,32 +490,35 @@ mod lz4_codec {
                     break;
                 }
             }
-            encoder.finish().1.map_err(|e| e.into())
+            match encoder.finish() {
+                Ok(_) => Ok(()),
+                Err(e) => Err(ParquetError::External(Box::new(e))),
+            }
         }
     }
 }
-#[cfg(any(feature = "lz4", test))]
+
+#[cfg(all(feature = "experimental", any(feature = "lz4", test)))]
 pub use lz4_codec::*;
 
 #[cfg(any(feature = "zstd", test))]
 mod zstd_codec {
     use std::io::{self, Write};
 
-    use crate::compression::Codec;
+    use crate::compression::{Codec, ZstdLevel};
     use crate::errors::Result;
 
     /// Codec for Zstandard compression algorithm.
-    pub struct ZSTDCodec {}
+    pub struct ZSTDCodec {
+        level: ZstdLevel,
+    }
 
     impl ZSTDCodec {
         /// Creates new Zstandard compression codec.
-        pub(crate) fn new() -> Self {
-            Self {}
+        pub(crate) fn new(level: ZstdLevel) -> Self {
+            Self { level }
         }
     }
-
-    /// Compression level (1-21) for ZSTD. Choose 1 here for better compression speed.
-    const ZSTD_COMPRESSION_LEVEL: i32 = 1;
 
     impl Codec for ZSTDCodec {
         fn decompress(
@@ -388,7 +535,7 @@ mod zstd_codec {
         }
 
         fn compress(&mut self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
-            let mut encoder = zstd::Encoder::new(output_buf, ZSTD_COMPRESSION_LEVEL)?;
+            let mut encoder = zstd::Encoder::new(output_buf, self.level.0)?;
             encoder.write_all(input_buf)?;
             match encoder.finish() {
                 Ok(_) => Ok(()),
@@ -399,6 +546,37 @@ mod zstd_codec {
 }
 #[cfg(any(feature = "zstd", test))]
 pub use zstd_codec::*;
+
+/// Represents a valid zstd compression level.
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
+pub struct ZstdLevel(i32);
+
+impl CompressionLevel<i32> for ZstdLevel {
+    // zstd binds to C, and hence zstd::compression_level_range() is not const as this calls the
+    // underlying C library.
+    const MINIMUM_LEVEL: i32 = 1;
+    const MAXIMUM_LEVEL: i32 = 22;
+}
+
+impl ZstdLevel {
+    /// Attempts to create a zstd compression level from a given compression level.
+    ///
+    /// Compression levels must be valid (i.e. be acceptable for [`zstd::compression_level_range`]).
+    pub fn try_new(level: i32) -> Result<Self> {
+        Self::is_valid_level(level).map(|_| Self(level))
+    }
+
+    /// Returns the compression level.
+    pub fn compression_level(&self) -> i32 {
+        self.0
+    }
+}
+
+impl Default for ZstdLevel {
+    fn default() -> Self {
+        Self(1)
+    }
+}
 
 #[cfg(any(feature = "lz4", test))]
 mod lz4_raw_codec {
@@ -433,11 +611,7 @@ mod lz4_raw_codec {
                 }
             };
             output_buf.resize(offset + required_len, 0);
-            match lz4::block::decompress_to_buffer(
-                input_buf,
-                Some(required_len.try_into().unwrap()),
-                &mut output_buf[offset..],
-            ) {
+            match lz4_flex::block::decompress_into(input_buf, &mut output_buf[offset..]) {
                 Ok(n) => {
                     if n != required_len {
                         return Err(ParquetError::General(
@@ -446,25 +620,20 @@ mod lz4_raw_codec {
                     }
                     Ok(n)
                 }
-                Err(e) => Err(e.into()),
+                Err(e) => Err(ParquetError::External(Box::new(e))),
             }
         }
 
         fn compress(&mut self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
             let offset = output_buf.len();
-            let required_len = lz4::block::compress_bound(input_buf.len())?;
+            let required_len = lz4_flex::block::get_maximum_output_size(input_buf.len());
             output_buf.resize(offset + required_len, 0);
-            match lz4::block::compress_to_buffer(
-                input_buf,
-                None,
-                false,
-                &mut output_buf[offset..],
-            ) {
+            match lz4_flex::block::compress_into(input_buf, &mut output_buf[offset..]) {
                 Ok(n) => {
                     output_buf.truncate(offset + n);
                     Ok(())
                 }
-                Err(e) => Err(e.into()),
+                Err(e) => Err(ParquetError::External(Box::new(e))),
             }
         }
     }
@@ -507,10 +676,7 @@ mod lz4_hadoop_codec {
     /// Adapted from pola-rs [compression.rs:try_decompress_hadoop](https://pola-rs.github.io/polars/src/parquet2/compression.rs.html#225)
     /// Translated from the apache arrow c++ function [TryDecompressHadoop](https://github.com/apache/arrow/blob/bf18e6e4b5bb6180706b1ba0d597a65a4ce5ca48/cpp/src/arrow/util/compression_lz4.cc#L474).
     /// Returns error if decompression failed.
-    fn try_decompress_hadoop(
-        input_buf: &[u8],
-        output_buf: &mut [u8],
-    ) -> io::Result<usize> {
+    fn try_decompress_hadoop(input_buf: &[u8], output_buf: &mut [u8]) -> io::Result<usize> {
         // Parquet files written with the Hadoop Lz4Codec use their own framing.
         // The input buffer can contain an arbitrary number of "frames", each
         // with the following structure:
@@ -548,11 +714,9 @@ mod lz4_hadoop_codec {
                     "Not enough bytes to hold advertised output",
                 ));
             }
-            let decompressed_size = lz4::block::decompress_to_buffer(
-                &input[..expected_compressed_size as usize],
-                Some(output_len as i32),
-                output,
-            )?;
+            let decompressed_size =
+                lz4_flex::decompress_into(&input[..expected_compressed_size as usize], output)
+                    .map_err(|e| ParquetError::External(Box::new(e)))?;
             if decompressed_size != expected_decompressed_size as usize {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -600,32 +764,23 @@ mod lz4_hadoop_codec {
                 Ok(n) => {
                     if n != required_len {
                         return Err(ParquetError::General(
-                            "LZ4HadoopCodec uncompress_size is not the expected one"
-                                .into(),
+                            "LZ4HadoopCodec uncompress_size is not the expected one".into(),
                         ));
                     }
                     Ok(n)
                 }
                 Err(e) if !self.backward_compatible_lz4 => Err(e.into()),
                 // Fallback done to be backward compatible with older versions of this
-                // libray and older versions of parquet-cpp.
+                // library and older versions of parquet-cpp.
                 Err(_) => {
                     // Truncate any inserted element before tryingg next algorithm.
                     output_buf.truncate(output_len);
-                    match LZ4Codec::new().decompress(
-                        input_buf,
-                        output_buf,
-                        uncompress_size,
-                    ) {
+                    match LZ4Codec::new().decompress(input_buf, output_buf, uncompress_size) {
                         Ok(n) => Ok(n),
                         Err(_) => {
                             // Truncate any inserted element before tryingg next algorithm.
                             output_buf.truncate(output_len);
-                            LZ4RawCodec::new().decompress(
-                                input_buf,
-                                output_buf,
-                                uncompress_size,
-                            )
+                            LZ4RawCodec::new().decompress(input_buf, output_buf, uncompress_size)
                         }
                     }
                 }
@@ -742,14 +897,20 @@ mod tests {
 
     #[test]
     fn test_codec_gzip() {
-        test_codec_with_size(CodecType::GZIP);
-        test_codec_without_size(CodecType::GZIP);
+        for level in GzipLevel::MINIMUM_LEVEL..=GzipLevel::MAXIMUM_LEVEL {
+            let level = GzipLevel::try_new(level).unwrap();
+            test_codec_with_size(CodecType::GZIP(level));
+            test_codec_without_size(CodecType::GZIP(level));
+        }
     }
 
     #[test]
     fn test_codec_brotli() {
-        test_codec_with_size(CodecType::BROTLI);
-        test_codec_without_size(CodecType::BROTLI);
+        for level in BrotliLevel::MINIMUM_LEVEL..=BrotliLevel::MAXIMUM_LEVEL {
+            let level = BrotliLevel::try_new(level).unwrap();
+            test_codec_with_size(CodecType::BROTLI(level));
+            test_codec_without_size(CodecType::BROTLI(level));
+        }
     }
 
     #[test]
@@ -759,8 +920,11 @@ mod tests {
 
     #[test]
     fn test_codec_zstd() {
-        test_codec_with_size(CodecType::ZSTD);
-        test_codec_without_size(CodecType::ZSTD);
+        for level in ZstdLevel::MINIMUM_LEVEL..=ZstdLevel::MAXIMUM_LEVEL {
+            let level = ZstdLevel::try_new(level).unwrap();
+            test_codec_with_size(CodecType::ZSTD(level));
+            test_codec_without_size(CodecType::ZSTD(level));
+        }
     }
 
     #[test]

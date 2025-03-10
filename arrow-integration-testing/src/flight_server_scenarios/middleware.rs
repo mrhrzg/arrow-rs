@@ -15,13 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Middleware test for the Flight server.
+
 use std::pin::Pin;
 
 use arrow_flight::{
     flight_descriptor::DescriptorType, flight_service_server::FlightService,
-    flight_service_server::FlightServiceServer, Action, ActionType, Criteria, Empty,
-    FlightData, FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse,
-    PutResult, SchemaResult, Ticket,
+    flight_service_server::FlightServiceServer, Action, ActionType, Criteria, Empty, FlightData,
+    FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse, PollInfo, PutResult,
+    SchemaResult, Ticket,
 };
 use futures::Stream;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
@@ -31,6 +33,7 @@ type TonicStream<T> = Pin<Box<dyn Stream<Item = T> + Send + Sync + 'static>>;
 type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 type Result<T = (), E = Error> = std::result::Result<T, E>;
 
+/// Run a scenario that tests middleware.
 pub async fn scenario_setup(port: u16) -> Result {
     let service = MiddlewareScenarioImpl {};
     let svc = FlightServiceServer::new(service);
@@ -44,6 +47,7 @@ pub async fn scenario_setup(port: u16) -> Result {
     Ok(())
 }
 
+/// Middleware interceptor for testing
 #[derive(Clone, Default)]
 pub struct MiddlewareScenarioImpl {}
 
@@ -93,7 +97,7 @@ impl FlightService for MiddlewareScenarioImpl {
 
         let descriptor = request.into_inner();
 
-        if descriptor.r#type == DescriptorType::Cmd as i32 && descriptor.cmd == b"success"
+        if descriptor.r#type == DescriptorType::Cmd as i32 && descriptor.cmd.as_ref() == b"success"
         {
             // Return a fake location - the test doesn't read it
             let endpoint = super::endpoint("foo", "grpc+tcp://localhost:10010");
@@ -118,6 +122,13 @@ impl FlightService for MiddlewareScenarioImpl {
         }
 
         Err(status)
+    }
+
+    async fn poll_flight_info(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<PollInfo>, Status> {
+        Err(Status::unimplemented("Not yet implemented"))
     }
 
     async fn do_put(

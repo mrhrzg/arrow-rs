@@ -37,18 +37,23 @@ Options:
           [possible values: lf, crlf, cr]
 
   -e, --escape-char <ESCAPE_CHAR>
-          escape charactor
+          escape character
 
   -q, --quote-char <QUOTE_CHAR>
-          quate charactor
+          quote character
 
   -D, --double-quote <DOUBLE_QUOTE>
           double quote
           
           [possible values: true, false]
 
+  -C, --csv-compression <CSV_COMPRESSION>
+          compression mode of csv
+          
+          [default: UNCOMPRESSED]
+
   -c, --parquet-compression <PARQUET_COMPRESSION>
-          compression mode
+          compression mode of parquet
           
           [default: SNAPPY]
 
@@ -58,8 +63,13 @@ Options:
   -m, --max-row-group-size <MAX_ROW_GROUP_SIZE>
           max row group size
 
+      --enable-bloom-filter <ENABLE_BLOOM_FILTER>
+          whether to enable bloom filter writing
+          
+          [possible values: true, false]
+
       --help
           display usage help
 
   -V, --version
-          Print version information
+          Print version

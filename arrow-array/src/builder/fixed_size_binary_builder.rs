@@ -15,14 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::builder::null_buffer_builder::NullBufferBuilder;
 use crate::builder::{ArrayBuilder, UInt8BufferBuilder};
 use crate::{ArrayRef, FixedSizeBinaryArray};
+use arrow_buffer::Buffer;
+use arrow_buffer::NullBufferBuilder;
 use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType};
 use std::any::Any;
 use std::sync::Arc;
 
+/// Builder for [`FixedSizeBinaryArray`]
+/// ```
+/// # use arrow_array::builder::FixedSizeBinaryBuilder;
+/// # use arrow_array::Array;
+/// #
+/// let mut builder = FixedSizeBinaryBuilder::with_capacity(3, 5);
+/// // [b"hello", null, b"arrow"]
+/// builder.append_value(b"hello").unwrap();
+/// builder.append_null();
+/// builder.append_value(b"arrow").unwrap();
+///
+/// let array = builder.finish();
+/// assert_eq!(array.value(0), b"hello");
+/// assert!(array.is_null(1));
+/// assert_eq!(array.value(2), b"arrow");
+/// ```
 #[derive(Debug)]
 pub struct FixedSizeBinaryBuilder {
     values_builder: UInt8BufferBuilder,
@@ -41,8 +58,7 @@ impl FixedSizeBinaryBuilder {
     pub fn with_capacity(capacity: usize, byte_width: i32) -> Self {
         assert!(
             byte_width >= 0,
-            "value length ({}) of the array must >= 0",
-            byte_width
+            "value length ({byte_width}) of the array must >= 0"
         );
         Self {
             values_builder: UInt8BufferBuilder::new(capacity * byte_width as usize),
@@ -59,7 +75,8 @@ impl FixedSizeBinaryBuilder {
     pub fn append_value(&mut self, value: impl AsRef<[u8]>) -> Result<(), ArrowError> {
         if self.value_length != value.as_ref().len() as i32 {
             Err(ArrowError::InvalidArgumentError(
-                "Byte slice does not have the same length as FixedSizeBinaryBuilder value lengths".to_string()
+                "Byte slice does not have the same length as FixedSizeBinaryBuilder value lengths"
+                    .to_string(),
             ))
         } else {
             self.values_builder.append_slice(value.as_ref());
@@ -76,16 +93,37 @@ impl FixedSizeBinaryBuilder {
         self.null_buffer_builder.append_null();
     }
 
+    /// Returns the current values buffer as a slice
+    pub fn values_slice(&self) -> &[u8] {
+        self.values_builder.as_slice()
+    }
+
     /// Builds the [`FixedSizeBinaryArray`] and reset this builder.
     pub fn finish(&mut self) -> FixedSizeBinaryArray {
         let array_length = self.len();
-        let array_data_builder =
-            ArrayData::builder(DataType::FixedSizeBinary(self.value_length))
-                .add_buffer(self.values_builder.finish())
-                .null_bit_buffer(self.null_buffer_builder.finish())
-                .len(array_length);
+        let array_data_builder = ArrayData::builder(DataType::FixedSizeBinary(self.value_length))
+            .add_buffer(self.values_builder.finish())
+            .nulls(self.null_buffer_builder.finish())
+            .len(array_length);
         let array_data = unsafe { array_data_builder.build_unchecked() };
         FixedSizeBinaryArray::from(array_data)
+    }
+
+    /// Builds the [`FixedSizeBinaryArray`] without resetting the builder.
+    pub fn finish_cloned(&self) -> FixedSizeBinaryArray {
+        let array_length = self.len();
+        let values_buffer = Buffer::from_slice_ref(self.values_builder.as_slice());
+        let array_data_builder = ArrayData::builder(DataType::FixedSizeBinary(self.value_length))
+            .add_buffer(values_buffer)
+            .nulls(self.null_buffer_builder.finish_cloned())
+            .len(array_length);
+        let array_data = unsafe { array_data_builder.build_unchecked() };
+        FixedSizeBinaryArray::from(array_data)
+    }
+
+    /// Returns the current null buffer as a slice
+    pub fn validity_slice(&self) -> Option<&[u8]> {
+        self.null_buffer_builder.as_slice()
     }
 }
 
@@ -110,14 +148,14 @@ impl ArrayBuilder for FixedSizeBinaryBuilder {
         self.null_buffer_builder.len()
     }
 
-    /// Returns whether the number of array slots is zero
-    fn is_empty(&self) -> bool {
-        self.null_buffer_builder.is_empty()
-    }
-
     /// Builds the array and reset this builder.
     fn finish(&mut self) -> ArrayRef {
         Arc::new(self.finish())
+    }
+
+    /// Builds the array without resetting the builder.
+    fn finish_cloned(&self) -> ArrayRef {
+        Arc::new(self.finish_cloned())
     }
 }
 
@@ -126,8 +164,6 @@ mod tests {
     use super::*;
 
     use crate::Array;
-    use crate::FixedSizeBinaryArray;
-    use arrow_schema::DataType;
 
     #[test]
     fn test_fixed_size_binary_builder() {
@@ -143,6 +179,36 @@ mod tests {
         assert_eq!(3, array.len());
         assert_eq!(1, array.null_count());
         assert_eq!(10, array.value_offset(2));
+        assert_eq!(5, array.value_length());
+    }
+
+    #[test]
+    fn test_fixed_size_binary_builder_finish_cloned() {
+        let mut builder = FixedSizeBinaryBuilder::with_capacity(3, 5);
+
+        //  [b"hello", null, "arrow"]
+        builder.append_value(b"hello").unwrap();
+        builder.append_null();
+        builder.append_value(b"arrow").unwrap();
+        let mut array: FixedSizeBinaryArray = builder.finish_cloned();
+
+        assert_eq!(&DataType::FixedSizeBinary(5), array.data_type());
+        assert_eq!(3, array.len());
+        assert_eq!(1, array.null_count());
+        assert_eq!(10, array.value_offset(2));
+        assert_eq!(5, array.value_length());
+
+        //  [b"finis", null, "clone"]
+        builder.append_value(b"finis").unwrap();
+        builder.append_null();
+        builder.append_value(b"clone").unwrap();
+
+        array = builder.finish();
+
+        assert_eq!(&DataType::FixedSizeBinary(5), array.data_type());
+        assert_eq!(6, array.len());
+        assert_eq!(2, array.null_count());
+        assert_eq!(25, array.value_offset(5));
         assert_eq!(5, array.value_length());
     }
 

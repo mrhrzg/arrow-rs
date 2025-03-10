@@ -16,38 +16,43 @@
 // under the License.
 
 //! Common logic for interacting with remote object stores
+use std::{
+    fmt::Display,
+    ops::{Range, RangeBounds},
+};
+
 use super::Result;
 use bytes::Bytes;
 use futures::{stream::StreamExt, Stream, TryStreamExt};
 
-/// Returns the prefix to be passed to an object store
-#[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
-pub fn format_prefix(prefix: Option<&crate::path::Path>) -> Option<String> {
-    prefix
-        .filter(|x| !x.as_ref().is_empty())
-        .map(|p| format!("{}{}", p.as_ref(), crate::path::DELIMITER))
-}
+#[cfg(any(feature = "azure", feature = "http"))]
+pub(crate) static RFC1123_FMT: &str = "%a, %d %h %Y %T GMT";
 
-/// Returns a formatted HTTP range header as per
-/// <https://httpwg.org/specs/rfc7233.html#header.range>
-#[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
-pub fn format_http_range(range: std::ops::Range<usize>) -> String {
-    format!("bytes={}-{}", range.start, range.end.saturating_sub(1))
+// deserialize dates according to rfc1123
+#[cfg(any(feature = "azure", feature = "http"))]
+pub(crate) fn deserialize_rfc1123<'de, D>(
+    deserializer: D,
+) -> Result<chrono::DateTime<chrono::Utc>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: String = serde::Deserialize::deserialize(deserializer)?;
+    let naive =
+        chrono::NaiveDateTime::parse_from_str(&s, RFC1123_FMT).map_err(serde::de::Error::custom)?;
+    Ok(chrono::TimeZone::from_utc_datetime(&chrono::Utc, &naive))
 }
 
 #[cfg(any(feature = "aws", feature = "azure"))]
-pub(crate) fn hmac_sha256(
-    secret: impl AsRef<[u8]>,
-    bytes: impl AsRef<[u8]>,
-) -> ring::hmac::Tag {
+pub(crate) fn hmac_sha256(secret: impl AsRef<[u8]>, bytes: impl AsRef<[u8]>) -> ring::hmac::Tag {
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_ref());
     ring::hmac::sign(&key, bytes.as_ref())
 }
 
 /// Collect a stream into [`Bytes`] avoiding copying in the event of a single chunk
-pub async fn collect_bytes<S>(mut stream: S, size_hint: Option<usize>) -> Result<Bytes>
+pub async fn collect_bytes<S, E>(mut stream: S, size_hint: Option<u64>) -> Result<Bytes, E>
 where
-    S: Stream<Item = Result<Bytes>> + Send + Unpin,
+    E: Send,
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin,
 {
     let first = stream.next().await.transpose()?.unwrap_or_default();
 
@@ -55,9 +60,9 @@ where
     match stream.next().await.transpose()? {
         None => Ok(first),
         Some(second) => {
-            let size_hint = size_hint.unwrap_or_else(|| first.len() + second.len());
+            let size_hint = size_hint.unwrap_or_else(|| first.len() as u64 + second.len() as u64);
 
-            let mut buf = Vec::with_capacity(size_hint);
+            let mut buf = Vec::with_capacity(size_hint as usize);
             buf.extend_from_slice(&first);
             buf.extend_from_slice(&second);
             while let Some(maybe_bytes) = stream.next().await {
@@ -69,9 +74,9 @@ where
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
 /// Takes a function and spawns it to a tokio blocking pool if available
-pub async fn maybe_spawn_blocking<F, T>(f: F) -> Result<T>
+pub(crate) async fn maybe_spawn_blocking<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
@@ -84,10 +89,10 @@ where
 
 /// Range requests with a gap less than or equal to this,
 /// will be coalesced into a single request by [`coalesce_ranges`]
-pub const OBJECT_STORE_COALESCE_DEFAULT: usize = 1024 * 1024;
+pub const OBJECT_STORE_COALESCE_DEFAULT: u64 = 1024 * 1024;
 
 /// Up to this number of range requests will be performed in parallel by [`coalesce_ranges`]
-pub const OBJECT_STORE_COALESCE_PARALLEL: usize = 10;
+pub(crate) const OBJECT_STORE_COALESCE_PARALLEL: usize = 10;
 
 /// Takes a function `fetch` that can fetch a range of bytes and uses this to
 /// fetch the provided byte `ranges`
@@ -97,14 +102,15 @@ pub const OBJECT_STORE_COALESCE_PARALLEL: usize = 10;
 /// * Combine ranges less than `coalesce` bytes apart into a single call to `fetch`
 /// * Make multiple `fetch` requests in parallel (up to maximum of 10)
 ///
-pub async fn coalesce_ranges<F, Fut>(
-    ranges: &[std::ops::Range<usize>],
+pub async fn coalesce_ranges<F, E, Fut>(
+    ranges: &[Range<u64>],
     fetch: F,
-    coalesce: usize,
-) -> Result<Vec<Bytes>>
+    coalesce: u64,
+) -> Result<Vec<Bytes>, E>
 where
-    F: Send + FnMut(std::ops::Range<usize>) -> Fut,
-    Fut: std::future::Future<Output = Result<Bytes>> + Send,
+    F: Send + FnMut(Range<u64>) -> Fut,
+    E: Send,
+    Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
 {
     let fetch_ranges = merge_ranges(ranges, coalesce);
 
@@ -123,16 +129,14 @@ where
 
             let start = range.start - fetch_range.start;
             let end = range.end - fetch_range.start;
-            fetch_bytes.slice(start..end)
+            let range = (start as usize)..(end as usize).min(fetch_bytes.len());
+            fetch_bytes.slice(range)
         })
         .collect())
 }
 
 /// Returns a sorted list of ranges that cover `ranges`
-fn merge_ranges(
-    ranges: &[std::ops::Range<usize>],
-    coalesce: usize,
-) -> Vec<std::ops::Range<usize>> {
+fn merge_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
     if ranges.is_empty() {
         return vec![];
     }
@@ -169,8 +173,161 @@ fn merge_ranges(
     ret
 }
 
+/// Request only a portion of an object's bytes
+///
+/// These can be created from [usize] ranges, like
+///
+/// ```rust
+/// # use object_store::GetRange;
+/// let range1: GetRange = (50..150).into();
+/// let range2: GetRange = (50..=150).into();
+/// let range3: GetRange = (50..).into();
+/// let range4: GetRange = (..150).into();
+/// ```
+///
+/// Implementations may wish to inspect [`GetResult`] for the exact byte
+/// range returned.
+///
+/// [`GetResult`]: crate::GetResult
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum GetRange {
+    /// Request a specific range of bytes
+    ///
+    /// If the given range is zero-length or starts after the end of the object,
+    /// an error will be returned. Additionally, if the range ends after the end
+    /// of the object, the entire remainder of the object will be returned.
+    /// Otherwise, the exact requested range will be returned.
+    ///
+    /// Note that range is u64 (i.e., not usize),
+    /// as `object_store` supports 32-bit architectures such as WASM
+    Bounded(Range<u64>),
+    /// Request all bytes starting from a given byte offset
+    Offset(u64),
+    /// Request up to the last n bytes
+    Suffix(u64),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum InvalidGetRange {
+    #[error("Wanted range starting at {requested}, but object was only {length} bytes long")]
+    StartTooLarge { requested: u64, length: u64 },
+
+    #[error("Range started at {start} and ended at {end}")]
+    Inconsistent { start: u64, end: u64 },
+
+    #[error("Range {requested} is larger than system memory limit {max}")]
+    TooLarge { requested: u64, max: u64 },
+}
+
+impl GetRange {
+    pub(crate) fn is_valid(&self) -> Result<(), InvalidGetRange> {
+        if let Self::Bounded(r) = self {
+            if r.end <= r.start {
+                return Err(InvalidGetRange::Inconsistent {
+                    start: r.start,
+                    end: r.end,
+                });
+            }
+            if (r.end - r.start) > usize::MAX as u64 {
+                return Err(InvalidGetRange::TooLarge {
+                    requested: r.start,
+                    max: usize::MAX as u64,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Convert to a [`Range`] if valid.
+    pub(crate) fn as_range(&self, len: u64) -> Result<Range<u64>, InvalidGetRange> {
+        self.is_valid()?;
+        match self {
+            Self::Bounded(r) => {
+                if r.start >= len {
+                    Err(InvalidGetRange::StartTooLarge {
+                        requested: r.start,
+                        length: len,
+                    })
+                } else if r.end > len {
+                    Ok(r.start..len)
+                } else {
+                    Ok(r.clone())
+                }
+            }
+            Self::Offset(o) => {
+                if *o >= len {
+                    Err(InvalidGetRange::StartTooLarge {
+                        requested: *o,
+                        length: len,
+                    })
+                } else {
+                    Ok(*o..len)
+                }
+            }
+            Self::Suffix(n) => Ok(len.saturating_sub(*n)..len),
+        }
+    }
+}
+
+impl Display for GetRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bounded(r) => write!(f, "bytes={}-{}", r.start, r.end - 1),
+            Self::Offset(o) => write!(f, "bytes={o}-"),
+            Self::Suffix(n) => write!(f, "bytes=-{n}"),
+        }
+    }
+}
+
+impl<T: RangeBounds<u64>> From<T> for GetRange {
+    fn from(value: T) -> Self {
+        use std::ops::Bound::*;
+        let first = match value.start_bound() {
+            Included(i) => *i,
+            Excluded(i) => i + 1,
+            Unbounded => 0,
+        };
+        match value.end_bound() {
+            Included(i) => Self::Bounded(first..(i + 1)),
+            Excluded(i) => Self::Bounded(first..*i),
+            Unbounded => Self::Offset(first),
+        }
+    }
+}
+// http://docs.aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html
+//
+// Do not URI-encode any of the unreserved characters that RFC 3986 defines:
+// A-Z, a-z, 0-9, hyphen ( - ), underscore ( _ ), period ( . ), and tilde ( ~ ).
+#[cfg(any(feature = "aws", feature = "gcp"))]
+pub(crate) const STRICT_ENCODE_SET: percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Computes the SHA256 digest of `body` returned as a hex encoded string
+#[cfg(any(feature = "aws", feature = "gcp"))]
+pub(crate) fn hex_digest(bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    hex_encode(digest.as_ref())
+}
+
+/// Returns `bytes` as a lower-case hex encoded string
+#[cfg(any(feature = "aws", feature = "gcp"))]
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        // String writing is infallible
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::Error;
+
     use super::*;
     use rand::{thread_rng, Rng};
     use std::ops::Range;
@@ -178,16 +335,18 @@ mod tests {
     /// Calls coalesce_ranges and validates the returned data is correct
     ///
     /// Returns the fetched ranges
-    async fn do_fetch(ranges: Vec<Range<usize>>, coalesce: usize) -> Vec<Range<usize>> {
+    async fn do_fetch(ranges: Vec<Range<u64>>, coalesce: u64) -> Vec<Range<u64>> {
         let max = ranges.iter().map(|x| x.end).max().unwrap_or(0);
         let src: Vec<_> = (0..max).map(|x| x as u8).collect();
 
         let mut fetches = vec![];
-        let coalesced = coalesce_ranges(
+        let coalesced = coalesce_ranges::<_, Error, _>(
             &ranges,
             |range| {
                 fetches.push(range.clone());
-                futures::future::ready(Ok(Bytes::from(src[range].to_vec())))
+                let start = usize::try_from(range.start).unwrap();
+                let end = usize::try_from(range.end).unwrap();
+                futures::future::ready(Ok(Bytes::from(src[start..end].to_vec())))
             },
             coalesce,
         )
@@ -196,7 +355,10 @@ mod tests {
 
         assert_eq!(ranges.len(), coalesced.len());
         for (range, bytes) in ranges.iter().zip(coalesced) {
-            assert_eq!(bytes.as_ref(), &src[range.clone()]);
+            assert_eq!(
+                bytes.as_ref(),
+                &src[usize::try_from(range.start).unwrap()..usize::try_from(range.end).unwrap()]
+            );
         }
         fetches
     }
@@ -204,9 +366,9 @@ mod tests {
     #[tokio::test]
     async fn test_coalesce_ranges() {
         let fetches = do_fetch(vec![], 0).await;
-        assert_eq!(fetches, vec![]);
+        assert!(fetches.is_empty());
 
-        let fetches = do_fetch(vec![0..3], 0).await;
+        let fetches = do_fetch(vec![0..3; 1], 0).await;
         assert_eq!(fetches, vec![0..3]);
 
         let fetches = do_fetch(vec![0..2, 3..5], 0).await;
@@ -268,5 +430,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn getrange_str() {
+        assert_eq!(GetRange::Offset(0).to_string(), "bytes=0-");
+        assert_eq!(GetRange::Bounded(10..19).to_string(), "bytes=10-18");
+        assert_eq!(GetRange::Suffix(10).to_string(), "bytes=-10");
+    }
+
+    #[test]
+    fn getrange_from() {
+        assert_eq!(Into::<GetRange>::into(10..15), GetRange::Bounded(10..15),);
+        assert_eq!(Into::<GetRange>::into(10..=15), GetRange::Bounded(10..16),);
+        assert_eq!(Into::<GetRange>::into(10..), GetRange::Offset(10),);
+        assert_eq!(Into::<GetRange>::into(..=15), GetRange::Bounded(0..16));
+    }
+
+    #[test]
+    fn test_as_range() {
+        let range = GetRange::Bounded(2..5);
+        assert_eq!(range.as_range(5).unwrap(), 2..5);
+
+        let range = range.as_range(4).unwrap();
+        assert_eq!(range, 2..4);
+
+        let range = GetRange::Bounded(3..3);
+        let err = range.as_range(2).unwrap_err().to_string();
+        assert_eq!(err, "Range started at 3 and ended at 3");
+
+        let range = GetRange::Bounded(2..2);
+        let err = range.as_range(3).unwrap_err().to_string();
+        assert_eq!(err, "Range started at 2 and ended at 2");
+
+        let range = GetRange::Suffix(3);
+        assert_eq!(range.as_range(3).unwrap(), 0..3);
+        assert_eq!(range.as_range(2).unwrap(), 0..2);
+
+        let range = GetRange::Suffix(0);
+        assert_eq!(range.as_range(0).unwrap(), 0..0);
+
+        let range = GetRange::Offset(2);
+        let err = range.as_range(2).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Wanted range starting at 2, but object was only 2 bytes long"
+        );
+
+        let err = range.as_range(1).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Wanted range starting at 2, but object was only 1 bytes long"
+        );
+
+        let range = GetRange::Offset(1);
+        assert_eq!(range.as_range(2).unwrap(), 1..2);
     }
 }

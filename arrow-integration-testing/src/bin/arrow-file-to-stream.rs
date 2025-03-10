@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// The unused_crate_dependencies lint does not work well for crates defining additional examples/bin targets
+#![allow(unused_crate_dependencies)]
+
 use arrow::error::Result;
 use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::StreamWriter;
@@ -30,7 +33,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let f = File::open(&args.file_name)?;
+    let f = File::open(args.file_name)?;
     let reader = BufReader::new(f);
     let mut reader = FileReader::try_new(reader, None)?;
     let schema = reader.schema();

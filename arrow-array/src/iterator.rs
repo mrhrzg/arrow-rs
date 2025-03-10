@@ -18,9 +18,11 @@
 //! Idiomatic iterators for [`Array`](crate::Array)
 
 use crate::array::{
-    ArrayAccessor, BooleanArray, FixedSizeBinaryArray, GenericBinaryArray,
-    GenericListArray, GenericStringArray, PrimitiveArray,
+    ArrayAccessor, BooleanArray, FixedSizeBinaryArray, GenericBinaryArray, GenericListArray,
+    GenericStringArray, PrimitiveArray,
 };
+use crate::{FixedSizeListArray, GenericListViewArray, MapArray};
+use arrow_buffer::NullBuffer;
 
 /// An iterator that returns Some(T) or None, that can be used on any [`ArrayAccessor`]
 ///
@@ -39,12 +41,13 @@ use crate::array::{
 /// there are more efficient ways to iterate over just the non-null indices, this functionality
 /// is provided by [`compute::try_unary`]
 ///
-/// [`PrimitiveArray`]: [crate::PrimitiveArray]
-/// [`compute::unary`]: [arrow::compute::unary]
-/// [`compute::try_unary`]: [arrow::compute::try_unary]
+/// [`PrimitiveArray`]: crate::PrimitiveArray
+/// [`compute::unary`]: https://docs.rs/arrow/latest/arrow/compute/fn.unary.html
+/// [`compute::try_unary`]: https://docs.rs/arrow/latest/arrow/compute/fn.try_unary.html
 #[derive(Debug)]
 pub struct ArrayIter<T: ArrayAccessor> {
     array: T,
+    logical_nulls: Option<NullBuffer>,
     current: usize,
     current_end: usize,
 }
@@ -53,11 +56,21 @@ impl<T: ArrayAccessor> ArrayIter<T> {
     /// create a new iterator
     pub fn new(array: T) -> Self {
         let len = array.len();
+        let logical_nulls = array.logical_nulls();
         ArrayIter {
             array,
+            logical_nulls,
             current: 0,
             current_end: len,
         }
+    }
+
+    #[inline]
+    fn is_null(&self, idx: usize) -> bool {
+        self.logical_nulls
+            .as_ref()
+            .map(|x| x.is_null(idx))
+            .unwrap_or_default()
     }
 }
 
@@ -68,7 +81,7 @@ impl<T: ArrayAccessor> Iterator for ArrayIter<T> {
     fn next(&mut self) -> Option<Self::Item> {
         if self.current == self.current_end {
             None
-        } else if self.array.is_null(self.current) {
+        } else if self.is_null(self.current) {
             self.current += 1;
             Some(None)
         } else {
@@ -97,7 +110,7 @@ impl<T: ArrayAccessor> DoubleEndedIterator for ArrayIter<T> {
             None
         } else {
             self.current_end -= 1;
-            Some(if self.array.is_null(self.current_end) {
+            Some(if self.is_null(self.current_end) {
                 None
             } else {
                 // Safety:
@@ -116,12 +129,22 @@ impl<T: ArrayAccessor> ExactSizeIterator for ArrayIter<T> {}
 
 /// an iterator that returns Some(T) or None, that can be used on any PrimitiveArray
 pub type PrimitiveIter<'a, T> = ArrayIter<&'a PrimitiveArray<T>>;
+/// an iterator that returns Some(T) or None, that can be used on any BooleanArray
 pub type BooleanIter<'a> = ArrayIter<&'a BooleanArray>;
+/// an iterator that returns Some(T) or None, that can be used on any Utf8Array
 pub type GenericStringIter<'a, T> = ArrayIter<&'a GenericStringArray<T>>;
+/// an iterator that returns Some(T) or None, that can be used on any BinaryArray
 pub type GenericBinaryIter<'a, T> = ArrayIter<&'a GenericBinaryArray<T>>;
+/// an iterator that returns Some(T) or None, that can be used on any FixedSizeBinaryArray
 pub type FixedSizeBinaryIter<'a> = ArrayIter<&'a FixedSizeBinaryArray>;
+/// an iterator that returns Some(T) or None, that can be used on any FixedSizeListArray
+pub type FixedSizeListIter<'a> = ArrayIter<&'a FixedSizeListArray>;
+/// an iterator that returns Some(T) or None, that can be used on any ListArray
 pub type GenericListArrayIter<'a, O> = ArrayIter<&'a GenericListArray<O>>;
-
+/// an iterator that returns Some(T) or None, that can be used on any MapArray
+pub type MapArrayIter<'a> = ArrayIter<&'a MapArray>;
+/// an iterator that returns Some(T) or None, that can be used on any ListArray
+pub type GenericListViewArrayIter<'a, O> = ArrayIter<&'a GenericListViewArray<O>>;
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -165,8 +188,7 @@ mod tests {
 
     #[test]
     fn test_string_array_iter_round_trip() {
-        let array =
-            StringArray::from(vec![Some("a"), None, Some("aaa"), None, Some("aaaaa")]);
+        let array = StringArray::from(vec![Some("a"), None, Some("aaa"), None, Some("aaaaa")]);
         let array = Arc::new(array) as ArrayRef;
 
         let array = array.as_any().downcast_ref::<StringArray>().unwrap();
@@ -189,8 +211,7 @@ mod tests {
 
         // check if DoubleEndedIterator is implemented
         let result: StringArray = array.iter().rev().collect();
-        let rev_array =
-            StringArray::from(vec![Some("aaaaa"), None, Some("aaa"), None, Some("a")]);
+        let rev_array = StringArray::from(vec![Some("aaaaa"), None, Some("aaa"), None, Some("a")]);
         assert_eq!(result, rev_array);
         // check if ExactSizeIterator is implemented
         let _ = array.iter().rposition(|opt_b| opt_b == Some("a"));

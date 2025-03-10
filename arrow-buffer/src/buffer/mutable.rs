@@ -15,23 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::Buffer;
-use crate::alloc::Deallocation;
+use std::alloc::{handle_alloc_error, Layout};
+use std::mem;
+use std::ptr::NonNull;
+
+use crate::alloc::{Deallocation, ALIGNMENT};
 use crate::{
-    alloc,
     bytes::Bytes,
     native::{ArrowNativeType, ToByteSlice},
     util::bit_util,
 };
-use std::ptr::NonNull;
+
+use super::Buffer;
 
 /// A [`MutableBuffer`] is Arrow's interface to build a [`Buffer`] out of items or slices of items.
+///
 /// [`Buffer`]s created from [`MutableBuffer`] (via `into`) are guaranteed to have its pointer aligned
 /// along cache lines and in multiple of 64 bytes.
+///
 /// Use [MutableBuffer::push] to insert an item, [MutableBuffer::extend_from_slice]
 /// to insert many items, and `into` to convert it to [`Buffer`].
 ///
-/// For a safe, strongly typed API consider using `arrow::array::BufferBuilder`
+/// For a safe, strongly typed API consider using [`Vec`] and [`ScalarBuffer`](crate::ScalarBuffer)
+///
+/// Note: this may be deprecated in a future release ([#1176](https://github.com/apache/arrow-rs/issues/1176))
 ///
 /// # Example
 ///
@@ -49,25 +56,41 @@ pub struct MutableBuffer {
     data: NonNull<u8>,
     // invariant: len <= capacity
     len: usize,
-    capacity: usize,
+    layout: Layout,
 }
 
 impl MutableBuffer {
     /// Allocate a new [MutableBuffer] with initial capacity to be at least `capacity`.
+    ///
+    /// See [`MutableBuffer::with_capacity`].
     #[inline]
     pub fn new(capacity: usize) -> Self {
         Self::with_capacity(capacity)
     }
 
     /// Allocate a new [MutableBuffer] with initial capacity to be at least `capacity`.
+    ///
+    /// # Panics
+    ///
+    /// If `capacity`, when rounded up to the nearest multiple of [`ALIGNMENT`], is greater
+    /// then `isize::MAX`, then this function will panic.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         let capacity = bit_util::round_upto_multiple_of_64(capacity);
-        let ptr = alloc::allocate_aligned(capacity);
+        let layout = Layout::from_size_align(capacity, ALIGNMENT)
+            .expect("failed to create layout for MutableBuffer");
+        let data = match layout.size() {
+            0 => dangling_ptr(),
+            _ => {
+                // Safety: Verified size != 0
+                let raw_ptr = unsafe { std::alloc::alloc(layout) };
+                NonNull::new(raw_ptr).unwrap_or_else(|| handle_alloc_error(layout))
+            }
+        };
         Self {
-            data: ptr,
+            data,
             len: 0,
-            capacity,
+            layout,
         }
     }
 
@@ -83,13 +106,30 @@ impl MutableBuffer {
     /// assert_eq!(data[126], 0u8);
     /// ```
     pub fn from_len_zeroed(len: usize) -> Self {
-        let new_capacity = bit_util::round_upto_multiple_of_64(len);
-        let ptr = alloc::allocate_aligned_zeroed(new_capacity);
-        Self {
-            data: ptr,
-            len,
-            capacity: new_capacity,
-        }
+        let layout = Layout::from_size_align(len, ALIGNMENT).unwrap();
+        let data = match layout.size() {
+            0 => dangling_ptr(),
+            _ => {
+                // Safety: Verified size != 0
+                let raw_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+                NonNull::new(raw_ptr).unwrap_or_else(|| handle_alloc_error(layout))
+            }
+        };
+        Self { data, len, layout }
+    }
+
+    /// Allocates a new [MutableBuffer] from given `Bytes`.
+    pub(crate) fn from_bytes(bytes: Bytes) -> Result<Self, Bytes> {
+        let layout = match bytes.deallocation() {
+            Deallocation::Standard(layout) => *layout,
+            _ => return Err(bytes),
+        };
+
+        let len = bytes.len();
+        let data = bytes.ptr();
+        mem::forget(bytes);
+
+        Ok(Self { data, len, layout })
     }
 
     /// creates a new [MutableBuffer] with capacity and length capable of holding `len` bits.
@@ -106,7 +146,7 @@ impl MutableBuffer {
     /// the buffer directly (e.g., modifying the buffer by holding a mutable reference
     /// from `data_mut()`).
     pub fn with_bitset(mut self, end: usize, val: bool) -> Self {
-        assert!(end <= self.capacity);
+        assert!(end <= self.layout.size());
         let v = if val { 255 } else { 0 };
         unsafe {
             std::ptr::write_bytes(self.data.as_ptr(), v, end);
@@ -121,7 +161,14 @@ impl MutableBuffer {
     /// `len` of the buffer and so can be used to initialize the memory region from
     /// `len` to `capacity`.
     pub fn set_null_bits(&mut self, start: usize, count: usize) {
-        assert!(start + count <= self.capacity);
+        assert!(
+            start.saturating_add(count) <= self.layout.size(),
+            "range start index {start} and count {count} out of bounds for \
+            buffer of length {}",
+            self.layout.size(),
+        );
+
+        // Safety: `self.data[start..][..count]` is in-bounds and well-aligned for `u8`
         unsafe {
             std::ptr::write_bytes(self.data.as_ptr().add(start), 0, count);
         }
@@ -143,17 +190,33 @@ impl MutableBuffer {
     #[inline(always)]
     pub fn reserve(&mut self, additional: usize) {
         let required_cap = self.len + additional;
-        if required_cap > self.capacity {
-            // JUSTIFICATION
-            //  Benefit
-            //      necessity
-            //  Soundness
-            //      `self.data` is valid for `self.capacity`.
-            let (ptr, new_capacity) =
-                unsafe { reallocate(self.data, self.capacity, required_cap) };
-            self.data = ptr;
-            self.capacity = new_capacity;
+        if required_cap > self.layout.size() {
+            let new_capacity = bit_util::round_upto_multiple_of_64(required_cap);
+            let new_capacity = std::cmp::max(new_capacity, self.layout.size() * 2);
+            self.reallocate(new_capacity)
         }
+    }
+
+    #[cold]
+    fn reallocate(&mut self, capacity: usize) {
+        let new_layout = Layout::from_size_align(capacity, self.layout.align()).unwrap();
+        if new_layout.size() == 0 {
+            if self.layout.size() != 0 {
+                // Safety: data was allocated with layout
+                unsafe { std::alloc::dealloc(self.as_mut_ptr(), self.layout) };
+                self.layout = new_layout
+            }
+            return;
+        }
+
+        let data = match self.layout.size() {
+            // Safety: new_layout is not empty
+            0 => unsafe { std::alloc::alloc(new_layout) },
+            // Safety: verified new layout is valid and not empty
+            _ => unsafe { std::alloc::realloc(self.as_mut_ptr(), self.layout, capacity) },
+        };
+        self.data = NonNull::new(data).unwrap_or_else(|| handle_alloc_error(new_layout));
+        self.layout = new_layout;
     }
 
     /// Truncates this buffer to `len` bytes
@@ -207,17 +270,8 @@ impl MutableBuffer {
     /// ```
     pub fn shrink_to_fit(&mut self) {
         let new_capacity = bit_util::round_upto_multiple_of_64(self.len);
-        if new_capacity < self.capacity {
-            // JUSTIFICATION
-            //  Benefit
-            //      necessity
-            //  Soundness
-            //      `self.data` is valid for `self.capacity`.
-            let ptr =
-                unsafe { alloc::reallocate(self.data, self.capacity, new_capacity) };
-
-            self.data = ptr;
-            self.capacity = new_capacity;
+        if new_capacity < self.layout.size() {
+            self.reallocate(new_capacity)
         }
     }
 
@@ -234,11 +288,12 @@ impl MutableBuffer {
         self.len
     }
 
-    /// Returns the total capacity in this buffer.
+    /// Returns the total capacity in this buffer, in bytes.
+    ///
     /// The invariant `buffer.len() <= buffer.capacity()` is always upheld.
     #[inline]
     pub const fn capacity(&self) -> usize {
-        self.capacity
+        self.layout.size()
     }
 
     /// Clear all existing data from this buffer.
@@ -270,22 +325,11 @@ impl MutableBuffer {
         self.data.as_ptr()
     }
 
-    #[deprecated(
-        since = "2.0.0",
-        note = "This method is deprecated in favour of `into` from the trait `Into`."
-    )]
-    /// Freezes this buffer and return an immutable version of it.
-    pub fn freeze(self) -> Buffer {
-        self.into_buffer()
-    }
-
     #[inline]
     pub(super) fn into_buffer(self) -> Buffer {
-        let bytes = unsafe {
-            Bytes::new(self.data, self.len, Deallocation::Arrow(self.capacity))
-        };
+        let bytes = unsafe { Bytes::new(self.data, self.len, Deallocation::Standard(self.layout)) };
         std::mem::forget(self);
-        Buffer::from_bytes(bytes)
+        Buffer::from(bytes)
     }
 
     /// View this buffer as a mutable slice of a specific type.
@@ -298,8 +342,7 @@ impl MutableBuffer {
         // SAFETY
         // ArrowNativeType is trivially transmutable, is sealed to prevent potentially incorrect
         // implementation outside this crate, and this method checks alignment
-        let (prefix, offsets, suffix) =
-            unsafe { self.as_slice_mut().align_to_mut::<T>() };
+        let (prefix, offsets, suffix) = unsafe { self.as_slice_mut().align_to_mut::<T>() };
         assert!(prefix.is_empty() && suffix.is_empty());
         offsets
     }
@@ -329,8 +372,7 @@ impl MutableBuffer {
     /// ```
     #[inline]
     pub fn extend_from_slice<T: ArrowNativeType>(&mut self, items: &[T]) {
-        let len = items.len();
-        let additional = len * std::mem::size_of::<T>();
+        let additional = mem::size_of_val(items);
         self.reserve(additional);
         unsafe {
             // this assumes that `[ToByteSlice]` can be copied directly
@@ -426,18 +468,23 @@ impl MutableBuffer {
     }
 }
 
-/// # Safety
-/// `ptr` must be allocated for `old_capacity`.
-#[cold]
-unsafe fn reallocate(
-    ptr: NonNull<u8>,
-    old_capacity: usize,
-    new_capacity: usize,
-) -> (NonNull<u8>, usize) {
-    let new_capacity = bit_util::round_upto_multiple_of_64(new_capacity);
-    let new_capacity = std::cmp::max(new_capacity, old_capacity * 2);
-    let ptr = alloc::reallocate(ptr, old_capacity, new_capacity);
-    (ptr, new_capacity)
+/// Creates a non-null pointer with alignment of [`ALIGNMENT`]
+///
+/// This is similar to [`NonNull::dangling`]
+#[inline]
+pub(crate) fn dangling_ptr() -> NonNull<u8> {
+    // SAFETY: ALIGNMENT is a non-zero usize which is then cast
+    // to a *mut u8. Therefore, `ptr` is not null and the conditions for
+    // calling new_unchecked() are respected.
+    #[cfg(miri)]
+    {
+        // Since miri implies a nightly rust version we can use the unstable strict_provenance feature
+        unsafe { NonNull::new_unchecked(std::ptr::without_provenance_mut(ALIGNMENT)) }
+    }
+    #[cfg(not(miri))]
+    {
+        unsafe { NonNull::new_unchecked(ALIGNMENT as *mut u8) }
+    }
 }
 
 impl<A: ArrowNativeType> Extend<A> for MutableBuffer {
@@ -445,6 +492,21 @@ impl<A: ArrowNativeType> Extend<A> for MutableBuffer {
     fn extend<T: IntoIterator<Item = A>>(&mut self, iter: T) {
         let iterator = iter.into_iter();
         self.extend_from_iter(iterator)
+    }
+}
+
+impl<T: ArrowNativeType> From<Vec<T>> for MutableBuffer {
+    fn from(value: Vec<T>) -> Self {
+        // Safety
+        // Vec::as_ptr guaranteed to not be null and ArrowNativeType are trivially transmutable
+        let data = unsafe { NonNull::new_unchecked(value.as_ptr() as _) };
+        let len = value.len() * mem::size_of::<T>();
+        // Safety
+        // Vec guaranteed to have a valid layout matching that of `Layout::array`
+        // This is based on `RawVec::current_memory`
+        let layout = unsafe { Layout::array::<T>(value.capacity()).unwrap_unchecked() };
+        mem::forget(value);
+        Self { data, len, layout }
     }
 }
 
@@ -462,7 +524,7 @@ impl MutableBuffer {
         // this is necessary because of https://github.com/rust-lang/rust/issues/32155
         let mut len = SetLenOnDrop::new(&mut self.len);
         let mut dst = unsafe { self.data.as_ptr().add(len.local_len) };
-        let capacity = self.capacity;
+        let capacity = self.layout.size();
 
         while len.local_len + item_size <= capacity {
             if let Some(item) = iterator.next() {
@@ -543,9 +605,7 @@ impl MutableBuffer {
     //    we can't specialize `extend` for `TrustedLen` like `Vec` does.
     // 2. `from_trusted_len_iter_bool` is faster.
     #[inline]
-    pub unsafe fn from_trusted_len_iter_bool<I: Iterator<Item = bool>>(
-        mut iterator: I,
-    ) -> Self {
+    pub unsafe fn from_trusted_len_iter_bool<I: Iterator<Item = bool>>(mut iterator: I) -> Self {
         let (_, upper) = iterator.size_hint();
         let len = upper.expect("from_trusted_len_iter requires an upper limit");
 
@@ -562,10 +622,10 @@ impl MutableBuffer {
     pub unsafe fn try_from_trusted_len_iter<
         E,
         T: ArrowNativeType,
-        I: Iterator<Item = std::result::Result<T, E>>,
+        I: Iterator<Item = Result<T, E>>,
     >(
         iterator: I,
-    ) -> std::result::Result<Self, E> {
+    ) -> Result<Self, E> {
         let item_size = std::mem::size_of::<T>();
         let (_, upper) = iterator.size_hint();
         let upper = upper.expect("try_from_trusted_len_iter requires an upper limit");
@@ -596,6 +656,12 @@ impl MutableBuffer {
     }
 }
 
+impl Default for MutableBuffer {
+    fn default() -> Self {
+        Self::with_capacity(0)
+    }
+}
+
 impl std::ops::Deref for MutableBuffer {
     type Target = [u8];
 
@@ -612,7 +678,10 @@ impl std::ops::DerefMut for MutableBuffer {
 
 impl Drop for MutableBuffer {
     fn drop(&mut self) {
-        unsafe { alloc::free_aligned(self.data, self.capacity) };
+        if self.layout.size() != 0 {
+            // Safety: data was allocated with standard allocator with given layout
+            unsafe { std::alloc::dealloc(self.data.as_ptr() as _, self.layout) };
+        }
     }
 }
 
@@ -621,7 +690,7 @@ impl PartialEq for MutableBuffer {
         if self.len != other.len {
             return false;
         }
-        if self.capacity != other.capacity {
+        if self.layout != other.layout {
             return false;
         }
         self.as_slice() == other.as_slice()
@@ -708,6 +777,14 @@ impl std::iter::FromIterator<bool> for MutableBuffer {
     }
 }
 
+impl<T: ArrowNativeType> std::iter::FromIterator<T> for MutableBuffer {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut buffer = Self::default();
+        buffer.extend_from_iter(iter.into_iter());
+        buffer
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,6 +795,19 @@ mod tests {
         assert_eq!(64, buf.capacity());
         assert_eq!(0, buf.len());
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_mutable_default() {
+        let buf = MutableBuffer::default();
+        assert_eq!(0, buf.capacity());
+        assert_eq!(0, buf.len());
+        assert!(buf.is_empty());
+
+        let mut buf = MutableBuffer::default();
+        buf.extend_from_slice(b"hello");
+        assert_eq!(5, buf.len());
+        assert_eq!(b"hello", buf.as_slice());
     }
 
     #[test]
@@ -794,7 +884,7 @@ mod tests {
     #[test]
     fn test_from_trusted_len_iter() {
         let iter = vec![1u32, 2].into_iter();
-        let buf = unsafe { Buffer::from_trusted_len_iter(iter) };
+        let buf = unsafe { MutableBuffer::from_trusted_len_iter(iter) };
         assert_eq!(8, buf.len());
         assert_eq!(&[1u8, 0, 0, 0, 2, 0, 0, 0], buf.as_slice());
     }
@@ -881,5 +971,46 @@ mod tests {
 
         buffer.shrink_to_fit();
         assert!(buffer.capacity() >= 64 && buffer.capacity() < 128);
+    }
+
+    #[test]
+    fn test_mutable_set_null_bits() {
+        let mut buffer = MutableBuffer::new(8).with_bitset(8, true);
+
+        for i in 0..=buffer.capacity() {
+            buffer.set_null_bits(i, 0);
+            assert_eq!(buffer[..8], [255; 8][..]);
+        }
+
+        buffer.set_null_bits(1, 4);
+        assert_eq!(buffer[..8], [255, 0, 0, 0, 0, 255, 255, 255][..]);
+    }
+
+    #[test]
+    #[should_panic = "out of bounds for buffer of length"]
+    fn test_mutable_set_null_bits_oob() {
+        let mut buffer = MutableBuffer::new(64);
+        buffer.set_null_bits(1, buffer.capacity());
+    }
+
+    #[test]
+    #[should_panic = "out of bounds for buffer of length"]
+    fn test_mutable_set_null_bits_oob_by_overflow() {
+        let mut buffer = MutableBuffer::new(0);
+        buffer.set_null_bits(1, usize::MAX);
+    }
+
+    #[test]
+    fn from_iter() {
+        let buffer = [1u16, 2, 3, 4].into_iter().collect::<MutableBuffer>();
+        assert_eq!(buffer.len(), 4 * mem::size_of::<u16>());
+        assert_eq!(buffer.as_slice(), &[1, 0, 2, 0, 3, 0, 4, 0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "failed to create layout for MutableBuffer: LayoutError")]
+    fn test_with_capacity_panics_above_max_capacity() {
+        let max_capacity = isize::MAX as usize - (isize::MAX as usize % ALIGNMENT);
+        let _ = MutableBuffer::with_capacity(max_capacity + 1);
     }
 }

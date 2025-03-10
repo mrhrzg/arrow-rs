@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Integration tests for the Flight server.
+
+use core::str;
 use std::collections::HashMap;
-use std::convert::TryFrom;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -25,17 +27,16 @@ use arrow::{
     buffer::Buffer,
     datatypes::Schema,
     datatypes::SchemaRef,
-    ipc::{self, reader},
+    ipc::{self, reader, writer},
     record_batch::RecordBatch,
 };
 use arrow_flight::{
     flight_descriptor::DescriptorType, flight_service_server::FlightService,
-    flight_service_server::FlightServiceServer, Action, ActionType, Criteria, Empty,
-    FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
-    HandshakeResponse, IpcMessage, PutResult, SchemaAsIpc, SchemaResult, Ticket,
+    flight_service_server::FlightServiceServer, Action, ActionType, Criteria, Empty, FlightData,
+    FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, IpcMessage,
+    PollInfo, PutResult, SchemaAsIpc, SchemaResult, Ticket,
 };
 use futures::{channel::mpsc, sink::SinkExt, Stream, StreamExt};
-use std::convert::TryInto;
 use tokio::sync::Mutex;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 
@@ -44,11 +45,16 @@ type TonicStream<T> = Pin<Box<dyn Stream<Item = T> + Send + Sync + 'static>>;
 type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 type Result<T = (), E = Error> = std::result::Result<T, E>;
 
+/// Run a scenario that tests integration testing.
 pub async fn scenario_setup(port: u16) -> Result {
     let addr = super::listen_on(port).await?;
+    let resolved_port = addr.port();
 
     let service = FlightServiceImpl {
-        server_location: format!("grpc+tcp://{}", addr),
+        // See https://github.com/apache/arrow-rs/issues/6577
+        // C# had trouble resolving addressed like 0.0.0.0:port
+        // server_location: format!("grpc+tcp://{addr}"),
+        server_location: format!("grpc+tcp://localhost:{resolved_port}"),
         ..Default::default()
     };
     let svc = FlightServiceServer::new(service);
@@ -67,6 +73,7 @@ struct IntegrationDataset {
     chunks: Vec<RecordBatch>,
 }
 
+/// Flight service implementation for integration testing
 #[derive(Clone, Default)]
 pub struct FlightServiceImpl {
     server_location: String,
@@ -102,34 +109,54 @@ impl FlightService for FlightServiceImpl {
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = request.into_inner();
 
-        let key = String::from_utf8(ticket.ticket.to_vec())
-            .map_err(|e| Status::invalid_argument(format!("Invalid ticket: {:?}", e)))?;
+        let key = str::from_utf8(&ticket.ticket)
+            .map_err(|e| Status::invalid_argument(format!("Invalid ticket: {e:?}")))?;
 
         let uploaded_chunks = self.uploaded_chunks.lock().await;
 
-        let flight = uploaded_chunks.get(&key).ok_or_else(|| {
-            Status::not_found(format!("Could not find flight. {}", key))
-        })?;
+        let flight = uploaded_chunks
+            .get(key)
+            .ok_or_else(|| Status::not_found(format!("Could not find flight. {key}")))?;
 
         let options = arrow::ipc::writer::IpcWriteOptions::default();
+        #[allow(deprecated)]
+        let mut dictionary_tracker =
+            writer::DictionaryTracker::new_with_preserve_dict_id(false, options.preserve_dict_id());
+        let data_gen = writer::IpcDataGenerator::default();
+        let data = IpcMessage(
+            data_gen
+                .schema_to_bytes_with_dictionary_tracker(
+                    &flight.schema,
+                    &mut dictionary_tracker,
+                    &options,
+                )
+                .ipc_message
+                .into(),
+        );
+        let schema_flight_data = FlightData {
+            data_header: data.0,
+            ..Default::default()
+        };
 
-        let schema =
-            std::iter::once(Ok(SchemaAsIpc::new(&flight.schema, &options).into()));
+        let schema = std::iter::once(Ok(schema_flight_data));
 
         let batches = flight
             .chunks
             .iter()
             .enumerate()
             .flat_map(|(counter, batch)| {
-                let (dictionary_flight_data, mut batch_flight_data) =
-                    arrow_flight::utils::flight_data_from_arrow_batch(batch, &options);
+                let (encoded_dictionaries, encoded_batch) = data_gen
+                    .encoded_batch(batch, &mut dictionary_tracker, &options)
+                    .expect("DictionaryTracker configured above to not error on replacement");
+
+                let dictionary_flight_data = encoded_dictionaries.into_iter().map(Into::into);
+                let mut batch_flight_data: FlightData = encoded_batch.into();
 
                 // Only the record batch's FlightData gets app_metadata
-                let metadata = counter.to_string().into_bytes();
+                let metadata = counter.to_string().into();
                 batch_flight_data.app_metadata = metadata;
 
                 dictionary_flight_data
-                    .into_iter()
                     .chain(std::iter::once(batch_flight_data))
                     .map(Ok)
             });
@@ -173,8 +200,7 @@ impl FlightService for FlightServiceImpl {
 
                 let endpoint = self.endpoint_from_path(&path[0]);
 
-                let total_records: usize =
-                    flight.chunks.iter().map(|chunk| chunk.num_rows()).sum();
+                let total_records: usize = flight.chunks.iter().map(|chunk| chunk.num_rows()).sum();
 
                 let options = arrow::ipc::writer::IpcWriteOptions::default();
                 let message = SchemaAsIpc::new(&flight.schema, &options)
@@ -191,12 +217,21 @@ impl FlightService for FlightServiceImpl {
                     endpoint: vec![endpoint],
                     total_records: total_records as i64,
                     total_bytes: -1,
+                    ordered: false,
+                    app_metadata: vec![].into(),
                 };
 
                 Ok(Response::new(info))
             }
-            other => Err(Status::unimplemented(format!("Request type: {}", other))),
+            other => Err(Status::unimplemented(format!("Request type: {other}"))),
         }
+    }
+
+    async fn poll_flight_info(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<PollInfo>, Status> {
+        Err(Status::unimplemented("Not yet implemented"))
     }
 
     async fn do_put(
@@ -214,15 +249,14 @@ impl FlightService for FlightServiceImpl {
             .clone()
             .ok_or_else(|| Status::invalid_argument("Must have a descriptor"))?;
 
-        if descriptor.r#type != DescriptorType::Path as i32 || descriptor.path.is_empty()
-        {
+        if descriptor.r#type != DescriptorType::Path as i32 || descriptor.path.is_empty() {
             return Err(Status::invalid_argument("Must specify a path"));
         }
 
         let key = descriptor.path[0].clone();
 
         let schema = Schema::try_from(&flight_data)
-            .map_err(|e| Status::invalid_argument(format!("Invalid schema: {:?}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("Invalid schema: {e:?}")))?;
         let schema_ref = Arc::new(schema.clone());
 
         let (response_tx, response_rx) = mpsc::channel(10);
@@ -275,10 +309,10 @@ async fn send_app_metadata(
     app_metadata: &[u8],
 ) -> Result<(), Status> {
     tx.send(Ok(PutResult {
-        app_metadata: app_metadata.to_vec(),
+        app_metadata: app_metadata.to_vec().into(),
     }))
     .await
-    .map_err(|e| Status::internal(format!("Could not send PutResult: {:?}", e)))
+    .map_err(|e| Status::internal(format!("Could not send PutResult: {e:?}")))
 }
 
 async fn record_batch_from_message(
@@ -287,9 +321,9 @@ async fn record_batch_from_message(
     schema_ref: SchemaRef,
     dictionaries_by_id: &HashMap<i64, ArrayRef>,
 ) -> Result<RecordBatch, Status> {
-    let ipc_batch = message.header_as_record_batch().ok_or_else(|| {
-        Status::internal("Could not parse message header as record batch")
-    })?;
+    let ipc_batch = message
+        .header_as_record_batch()
+        .ok_or_else(|| Status::internal("Could not parse message header as record batch"))?;
 
     let arrow_batch_result = reader::read_record_batch(
         data_body,
@@ -300,9 +334,8 @@ async fn record_batch_from_message(
         &message.version(),
     );
 
-    arrow_batch_result.map_err(|e| {
-        Status::internal(format!("Could not convert to RecordBatch: {:?}", e))
-    })
+    arrow_batch_result
+        .map_err(|e| Status::internal(format!("Could not convert to RecordBatch: {e:?}")))
 }
 
 async fn dictionary_from_message(
@@ -311,9 +344,9 @@ async fn dictionary_from_message(
     schema_ref: SchemaRef,
     dictionaries_by_id: &mut HashMap<i64, ArrayRef>,
 ) -> Result<(), Status> {
-    let ipc_batch = message.header_as_dictionary_batch().ok_or_else(|| {
-        Status::internal("Could not parse message header as dictionary batch")
-    })?;
+    let ipc_batch = message
+        .header_as_dictionary_batch()
+        .ok_or_else(|| Status::internal("Could not parse message header as dictionary batch"))?;
 
     let dictionary_batch_result = reader::read_dictionary(
         data_body,
@@ -322,9 +355,8 @@ async fn dictionary_from_message(
         dictionaries_by_id,
         &message.version(),
     );
-    dictionary_batch_result.map_err(|e| {
-        Status::internal(format!("Could not convert to Dictionary: {:?}", e))
-    })
+    dictionary_batch_result
+        .map_err(|e| Status::internal(format!("Could not convert to Dictionary: {e:?}")))
 }
 
 async fn save_uploaded_chunks(
@@ -342,7 +374,7 @@ async fn save_uploaded_chunks(
 
     while let Some(Ok(data)) = input_stream.next().await {
         let message = arrow::ipc::root_as_message(&data.data_header[..])
-            .map_err(|e| Status::internal(format!("Could not parse message: {:?}", e)))?;
+            .map_err(|e| Status::internal(format!("Could not parse message: {e:?}")))?;
 
         match message.header_type() {
             ipc::MessageHeader::Schema => {
@@ -355,7 +387,7 @@ async fn save_uploaded_chunks(
 
                 let batch = record_batch_from_message(
                     message,
-                    &Buffer::from(data.data_body),
+                    &Buffer::from(data.data_body.as_ref()),
                     schema_ref.clone(),
                     &dictionaries_by_id,
                 )
@@ -366,7 +398,7 @@ async fn save_uploaded_chunks(
             ipc::MessageHeader::DictionaryBatch => {
                 dictionary_from_message(
                     message,
-                    &Buffer::from(data.data_body),
+                    &Buffer::from(data.data_body.as_ref()),
                     schema_ref.clone(),
                     &mut dictionaries_by_id,
                 )
@@ -375,8 +407,7 @@ async fn save_uploaded_chunks(
             t => {
                 return Err(Status::internal(format!(
                     "Reading types other than record batches not yet supported, \
-                                              unable to read {:?}",
-                    t
+                                              unable to read {t:?}"
                 )));
             }
         }

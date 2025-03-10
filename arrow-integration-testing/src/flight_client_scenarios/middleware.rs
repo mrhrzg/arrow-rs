@@ -15,23 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Scenario for testing middleware.
+
 use arrow_flight::{
-    flight_descriptor::DescriptorType, flight_service_client::FlightServiceClient,
-    FlightDescriptor,
+    flight_descriptor::DescriptorType, flight_service_client::FlightServiceClient, FlightDescriptor,
 };
+use prost::bytes::Bytes;
 use tonic::{Request, Status};
 
 type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 type Result<T = (), E = Error> = std::result::Result<T, E>;
 
+/// Run a scenario that tests middleware.
 pub async fn run_scenario(host: &str, port: u16) -> Result {
-    let url = format!("http://{}:{}", host, port);
+    let url = format!("http://{host}:{port}");
     let conn = tonic::transport::Endpoint::new(url)?.connect().await?;
     let mut client = FlightServiceClient::with_interceptor(conn, middleware_interceptor);
 
     let mut descriptor = FlightDescriptor::default();
     descriptor.set_type(DescriptorType::Cmd);
-    descriptor.cmd = b"".to_vec();
+    descriptor.cmd = Bytes::from_static(b"");
 
     // This call is expected to fail.
     match client
@@ -47,8 +50,7 @@ pub async fn run_scenario(host: &str, port: u16) -> Result {
             if value != "expected value" {
                 let msg = format!(
                     "On failing call: Expected to receive header 'x-middleware: expected value', \
-                     but instead got: '{}'",
-                    value
+                     but instead got: '{value}'"
                 );
                 return Err(Box::new(Status::internal(msg)));
             }
@@ -56,7 +58,7 @@ pub async fn run_scenario(host: &str, port: u16) -> Result {
     }
 
     // This call should succeed
-    descriptor.cmd = b"success".to_vec();
+    descriptor.cmd = Bytes::from_static(b"success");
     let resp = client.get_flight_info(Request::new(descriptor)).await?;
 
     let headers = resp.metadata();
@@ -66,8 +68,7 @@ pub async fn run_scenario(host: &str, port: u16) -> Result {
     if value != "expected value" {
         let msg = format!(
             "On success call: Expected to receive header 'x-middleware: expected value', \
-            but instead got: '{}'",
-            value
+            but instead got: '{value}'"
         );
         return Err(Box::new(Status::internal(msg)));
     }

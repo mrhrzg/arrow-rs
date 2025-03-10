@@ -19,24 +19,22 @@
 //!
 //! **See [arrow_array] for examples and usage instructions**
 
-#[cfg(feature = "ffi")]
-mod ffi;
-mod ord;
-
 // --------------------- Array & ArrayData ---------------------
-pub use arrow_array::array::*;
 pub use arrow_array::builder::*;
 pub use arrow_array::cast::*;
 pub use arrow_array::iterator::*;
+pub use arrow_array::*;
 pub use arrow_data::{
-    layout, ArrayData, ArrayDataBuilder, ArrayDataRef, BufferSpec, DataTypeLayout,
+    layout, ArrayData, ArrayDataBuilder, ArrayDataRef, BufferSpec, ByteView, DataTypeLayout,
 };
 
 pub use arrow_data::transform::{Capacities, MutableArrayData};
 
 #[cfg(feature = "ffi")]
-pub use self::ffi::{export_array_into_raw, make_array_from_raw};
+#[allow(deprecated)]
+pub use arrow_array::ffi::export_array_into_raw;
 
 // --------------------- Array's values comparison ---------------------
 
-pub use self::ord::{build_compare, DynComparator};
+#[allow(deprecated)]
+pub use arrow_ord::ord::{build_compare, make_comparator, DynComparator};

@@ -19,12 +19,15 @@
 # tests for parquet crate
 name: "parquet"
 
+concurrency:
+  group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
 
-# trigger for all PRs that touch certain files and changes to master
+# trigger for all PRs that touch certain files and changes to main
 on:
   push:
     branches:
-      - master
+      - main
   pull_request:
     paths:
       - arrow/**
@@ -35,6 +38,9 @@ on:
       - arrow-schema/**
       - arrow-select/**
       - arrow-ipc/**
+      - arrow-csv/**
+      - arrow-json/**
+      - arrow-avro/**
       - parquet/**
       - .github/**
 
@@ -46,7 +52,7 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Setup Rust toolchain
@@ -55,7 +61,12 @@ jobs:
         run: cargo test -p parquet
       - name: Test --all-features
         run: cargo test -p parquet --all-features
-
+      - name: Run examples
+        run: |
+          # Test parquet examples
+          cargo run -p parquet --example read_parquet
+          cargo run -p parquet --example async_read_parquet --features="async"
+          cargo run -p parquet --example read_with_rowgroup --features="async"
 
   # test compilation
   linux-features:
@@ -64,7 +75,7 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Setup Rust toolchain
@@ -86,6 +97,8 @@ jobs:
         run: cargo check -p parquet --no-default-features
       - name: Check compilation --no-default-features --features arrow
         run: cargo check -p parquet --no-default-features --features arrow
+      - name: Check compilation --no-default-features --features simdutf8
+        run: cargo check -p parquet --no-default-features --features simdutf8
       - name: Check compilation --no-default-features --all-features
         run: cargo check -p parquet --all-features
       - name: Check compilation --all-targets
@@ -106,17 +119,53 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
-          target: wasm32-unknown-unknown,wasm32-wasi
+          target: wasm32-unknown-unknown,wasm32-wasip1
+      - name: Install clang # Needed for zlib compilation
+        run: apt-get update && apt-get install -y clang gcc-multilib
       - name: Build wasm32-unknown-unknown
-        run: cargo build -p parquet --no-default-features --features cli,snap,flate2,brotli --target wasm32-unknown-unknown
-      - name: Build wasm32-wasi
-        run: cargo build -p parquet --no-default-features --features cli,snap,flate2,brotli --target wasm32-wasi
+        run: cargo build -p parquet --target wasm32-unknown-unknown
+      - name: Build wasm32-wasip1
+        run: cargo build -p parquet --target wasm32-wasip1
+
+  pyspark-integration-test:
+    name: PySpark Integration Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: [ stable ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - name: Install Python dependencies
+        run: |
+          cd parquet/pytest
+          pip install -r requirements.txt
+      - name: Black check the test files
+        run: |
+          cd parquet/pytest
+          black --check *.py --verbose
+      - name: Setup Rust toolchain
+        run: |
+          rustup toolchain install ${{ matrix.rust }}
+          rustup default ${{ matrix.rust }}
+      - name: Install binary for checking
+        run: |
+          cargo install --path parquet --bin parquet-show-bloom-filter --features=cli
+          cargo install --path parquet --bin parquet-fromcsv --features=arrow,cli
+      - name: Run pytest
+        run: |
+          cd parquet/pytest
+          pytest -v
 
   clippy:
     name: Clippy
@@ -124,7 +173,7 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
       - name: Setup Clippy

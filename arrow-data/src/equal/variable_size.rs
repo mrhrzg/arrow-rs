@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::data::{count_nulls, ArrayData};
-use arrow_buffer::bit_util::get_bit;
+use crate::data::{contains_nulls, ArrayData};
 use arrow_buffer::ArrowNativeType;
 use num::Integer;
 
@@ -33,17 +32,18 @@ fn offset_value_equal<T: ArrowNativeType + Integer>(
 ) -> bool {
     let lhs_start = lhs_offsets[lhs_pos].as_usize();
     let rhs_start = rhs_offsets[rhs_pos].as_usize();
-    let lhs_len = lhs_offsets[lhs_pos + len] - lhs_offsets[lhs_pos];
-    let rhs_len = rhs_offsets[rhs_pos + len] - rhs_offsets[rhs_pos];
+    let lhs_len = (lhs_offsets[lhs_pos + len] - lhs_offsets[lhs_pos])
+        .to_usize()
+        .unwrap();
+    let rhs_len = (rhs_offsets[rhs_pos + len] - rhs_offsets[rhs_pos])
+        .to_usize()
+        .unwrap();
 
-    lhs_len == rhs_len
-        && equal_len(
-            lhs_values,
-            rhs_values,
-            lhs_start,
-            rhs_start,
-            lhs_len.to_usize().unwrap(),
-        )
+    if lhs_len == 0 && rhs_len == 0 {
+        return true;
+    }
+
+    lhs_len == rhs_len && equal_len(lhs_values, rhs_values, lhs_start, rhs_start, lhs_len)
 }
 
 pub(super) fn variable_sized_equal<T: ArrowNativeType + Integer>(
@@ -60,14 +60,9 @@ pub(super) fn variable_sized_equal<T: ArrowNativeType + Integer>(
     let lhs_values = lhs.buffers()[1].as_slice();
     let rhs_values = rhs.buffers()[1].as_slice();
 
-    let lhs_null_count = count_nulls(lhs.null_buffer(), lhs_start + lhs.offset(), len);
-    let rhs_null_count = count_nulls(rhs.null_buffer(), rhs_start + rhs.offset(), len);
-
-    if lhs_null_count == 0
-        && rhs_null_count == 0
-        && !lhs_values.is_empty()
-        && !rhs_values.is_empty()
-    {
+    // Only checking one null mask here because by the time the control flow reaches
+    // this point, the equality of the two masks would have already been verified.
+    if !contains_nulls(lhs.nulls(), lhs_start, len) {
         offset_value_equal(
             lhs_values,
             rhs_values,
@@ -83,15 +78,8 @@ pub(super) fn variable_sized_equal<T: ArrowNativeType + Integer>(
             let rhs_pos = rhs_start + i;
 
             // the null bits can still be `None`, indicating that the value is valid.
-            let lhs_is_null = !lhs
-                .null_buffer()
-                .map(|v| get_bit(v.as_slice(), lhs.offset() + lhs_pos))
-                .unwrap_or(true);
-
-            let rhs_is_null = !rhs
-                .null_buffer()
-                .map(|v| get_bit(v.as_slice(), rhs.offset() + rhs_pos))
-                .unwrap_or(true);
+            let lhs_is_null = lhs.nulls().map(|v| v.is_null(lhs_pos)).unwrap_or_default();
+            let rhs_is_null = rhs.nulls().map(|v| v.is_null(rhs_pos)).unwrap_or_default();
 
             lhs_is_null
                 || (lhs_is_null == rhs_is_null)

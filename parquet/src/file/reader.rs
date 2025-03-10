@@ -15,19 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Contains file reader API and provides methods to access file metadata, row group
-//! readers to read individual column chunks, or access record iterator.
+//! File reader API and methods to access file metadata, row group
+//! readers to read individual column chunks, or access record
+//! iterator.
 
-use bytes::Bytes;
-use std::{boxed::Box, io::Read, sync::Arc};
+use bytes::{Buf, Bytes};
+use std::fs::File;
+use std::io::{BufReader, Seek, SeekFrom};
+use std::{io::Read, sync::Arc};
 
+use crate::bloom_filter::Sbbf;
 use crate::column::page::PageIterator;
 use crate::column::{page::PageReader, reader::ColumnReader};
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::*;
 pub use crate::file::serialized_reader::{SerializedFileReader, SerializedPageReader};
 use crate::record::reader::RowIter;
-use crate::schema::types::{ColumnDescPtr, SchemaDescPtr, Type as SchemaType};
+use crate::schema::types::Type as SchemaType;
 
 use crate::basic::Type;
 
@@ -41,20 +45,61 @@ pub trait Length {
     fn len(&self) -> u64;
 }
 
-/// The ChunkReader trait generates readers of chunks of a source.
-/// For a file system reader, each chunk might contain a clone of File bounded on a given range.
-/// For an object store reader, each read can be mapped to a range request.
+/// Generates [`Read`]ers to read chunks of a Parquet data source.
+///
+/// The Parquet reader uses [`ChunkReader`] to access Parquet data, allowing
+/// multiple decoders to read concurrently from different locations in the same file.
+///
+/// The trait provides:
+/// * random access (via [`Self::get_bytes`])
+/// * sequential (via [`Self::get_read`])
+///
+/// # Provided Implementations
+/// * [`File`] for reading from local file system
+/// * [`Bytes`] for reading from an in-memory buffer
+///
+/// User provided implementations can implement more sophisticated behaviors
+/// such as on-demand buffering or scan sharing.
 pub trait ChunkReader: Length + Send + Sync {
-    type T: Read + Send;
-    /// Get a serially readable slice of the current reader
-    /// This should fail if the slice exceeds the current bounds
-    fn get_read(&self, start: u64, length: usize) -> Result<Self::T>;
+    /// The concrete type of reader returned by this trait
+    type T: Read;
 
-    /// Get a range as bytes
-    /// This should fail if the exact number of bytes cannot be read
+    /// Get a [`Read`] instance starting at the provided file offset
+    ///
+    /// Returned readers follow the model of [`File::try_clone`] where mutations
+    /// of one reader affect all readers. Thus subsequent or concurrent calls to
+    /// [`Self::get_read`] or [`Self::get_bytes`] may cause side-effects on
+    /// previously returned readers. Callers of `get_read` should take care
+    /// to avoid race conditions.
+    fn get_read(&self, start: u64) -> Result<Self::T>;
+
+    /// Get a range of data in memory as [`Bytes`]
+    ///
+    /// Similarly to [`Self::get_read`], this method may have side-effects on
+    /// previously returned readers.
+    fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes>;
+}
+
+impl Length for File {
+    fn len(&self) -> u64 {
+        self.metadata().map(|m| m.len()).unwrap_or(0u64)
+    }
+}
+
+impl ChunkReader for File {
+    type T = BufReader<File>;
+
+    fn get_read(&self, start: u64) -> Result<Self::T> {
+        let mut reader = self.try_clone()?;
+        reader.seek(SeekFrom::Start(start))?;
+        Ok(BufReader::new(self.try_clone()?))
+    }
+
     fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes> {
         let mut buffer = Vec::with_capacity(length);
-        let read = self.get_read(start, length)?.read_to_end(&mut buffer)?;
+        let mut reader = self.try_clone()?;
+        reader.seek(SeekFrom::Start(start))?;
+        let read = reader.take(length as _).read_to_end(&mut buffer)?;
 
         if read != length {
             return Err(eof_err!(
@@ -64,6 +109,26 @@ pub trait ChunkReader: Length + Send + Sync {
             ));
         }
         Ok(buffer.into())
+    }
+}
+
+impl Length for Bytes {
+    fn len(&self) -> u64 {
+        self.len() as u64
+    }
+}
+
+impl ChunkReader for Bytes {
+    type T = bytes::buf::Reader<Bytes>;
+
+    fn get_read(&self, start: u64) -> Result<Self::T> {
+        let start = start as usize;
+        Ok(self.slice(start..).reader())
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes> {
+        let start = start as usize;
+        Ok(self.slice(start..start + length))
     }
 }
 
@@ -82,7 +147,7 @@ pub trait FileReader: Send + Sync {
     /// Get the `i`th row group reader. Note this doesn't do bound check.
     fn get_row_group(&self, i: usize) -> Result<Box<dyn RowGroupReader + '_>>;
 
-    /// Get full iterator of `Row`s from a file (over all row groups).
+    /// Get an iterator over the row in this file, see [`RowIter`] for caveats.
     ///
     /// Iterator will automatically load the next row group to advance.
     ///
@@ -109,33 +174,28 @@ pub trait RowGroupReader: Send + Sync {
         let col_descr = schema_descr.column(i);
         let col_page_reader = self.get_column_page_reader(i)?;
         let col_reader = match col_descr.physical_type() {
-            Type::BOOLEAN => ColumnReader::BoolColumnReader(ColumnReaderImpl::new(
+            Type::BOOLEAN => {
+                ColumnReader::BoolColumnReader(ColumnReaderImpl::new(col_descr, col_page_reader))
+            }
+            Type::INT32 => {
+                ColumnReader::Int32ColumnReader(ColumnReaderImpl::new(col_descr, col_page_reader))
+            }
+            Type::INT64 => {
+                ColumnReader::Int64ColumnReader(ColumnReaderImpl::new(col_descr, col_page_reader))
+            }
+            Type::INT96 => {
+                ColumnReader::Int96ColumnReader(ColumnReaderImpl::new(col_descr, col_page_reader))
+            }
+            Type::FLOAT => {
+                ColumnReader::FloatColumnReader(ColumnReaderImpl::new(col_descr, col_page_reader))
+            }
+            Type::DOUBLE => {
+                ColumnReader::DoubleColumnReader(ColumnReaderImpl::new(col_descr, col_page_reader))
+            }
+            Type::BYTE_ARRAY => ColumnReader::ByteArrayColumnReader(ColumnReaderImpl::new(
                 col_descr,
                 col_page_reader,
             )),
-            Type::INT32 => ColumnReader::Int32ColumnReader(ColumnReaderImpl::new(
-                col_descr,
-                col_page_reader,
-            )),
-            Type::INT64 => ColumnReader::Int64ColumnReader(ColumnReaderImpl::new(
-                col_descr,
-                col_page_reader,
-            )),
-            Type::INT96 => ColumnReader::Int96ColumnReader(ColumnReaderImpl::new(
-                col_descr,
-                col_page_reader,
-            )),
-            Type::FLOAT => ColumnReader::FloatColumnReader(ColumnReaderImpl::new(
-                col_descr,
-                col_page_reader,
-            )),
-            Type::DOUBLE => ColumnReader::DoubleColumnReader(ColumnReaderImpl::new(
-                col_descr,
-                col_page_reader,
-            )),
-            Type::BYTE_ARRAY => ColumnReader::ByteArrayColumnReader(
-                ColumnReaderImpl::new(col_descr, col_page_reader),
-            ),
             Type::FIXED_LEN_BYTE_ARRAY => ColumnReader::FixedLenByteArrayColumnReader(
                 ColumnReaderImpl::new(col_descr, col_page_reader),
             ),
@@ -143,7 +203,11 @@ pub trait RowGroupReader: Send + Sync {
         Ok(col_reader)
     }
 
-    /// Get iterator of `Row`s from this row group.
+    /// Get bloom filter for the `i`th column chunk, if present and the reader was configured
+    /// to read bloom filters.
+    fn get_column_bloom_filter(&self, i: usize) -> Option<&Sbbf>;
+
+    /// Get an iterator over the row in this file, see [`RowIter`] for caveats.
     ///
     /// Projected schema can be a subset of or equal to the file schema, when it is None,
     /// full file schema is assumed.
@@ -208,16 +272,4 @@ impl Iterator for FilePageIterator {
     }
 }
 
-impl PageIterator for FilePageIterator {
-    fn schema(&mut self) -> Result<SchemaDescPtr> {
-        Ok(self
-            .file_reader
-            .metadata()
-            .file_metadata()
-            .schema_descr_ptr())
-    }
-
-    fn column_schema(&mut self) -> Result<ColumnDescPtr> {
-        self.schema().map(|s| s.column(self.column_index))
-    }
-}
+impl PageIterator for FilePageIterator {}

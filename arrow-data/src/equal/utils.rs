@@ -29,16 +29,9 @@ pub(super) fn equal_bits(
     rhs_start: usize,
     len: usize,
 ) -> bool {
-    let lhs = BitChunks::new(lhs_values, lhs_start, len);
-    let rhs = BitChunks::new(rhs_values, rhs_start, len);
-
-    for (a, b) in lhs.iter().zip(rhs.iter()) {
-        if a != b {
-            return false;
-        }
-    }
-
-    lhs.remainder_bits() == rhs.remainder_bits()
+    let lhs = BitChunks::new(lhs_values, lhs_start, len).iter_padded();
+    let rhs = BitChunks::new(rhs_values, rhs_start, len).iter_padded();
+    lhs.zip(rhs).all(|(a, b)| a == b)
 }
 
 #[inline]
@@ -49,15 +42,16 @@ pub(super) fn equal_nulls(
     rhs_start: usize,
     len: usize,
 ) -> bool {
-    let lhs_offset = lhs_start + lhs.offset();
-    let rhs_offset = rhs_start + rhs.offset();
-
-    match (lhs.null_buffer(), rhs.null_buffer()) {
-        (Some(lhs), Some(rhs)) => {
-            equal_bits(lhs.as_slice(), rhs.as_slice(), lhs_offset, rhs_offset, len)
-        }
-        (Some(lhs), None) => !contains_nulls(Some(lhs), lhs_offset, len),
-        (None, Some(rhs)) => !contains_nulls(Some(rhs), rhs_offset, len),
+    match (lhs.nulls(), rhs.nulls()) {
+        (Some(lhs), Some(rhs)) => equal_bits(
+            lhs.validity(),
+            rhs.validity(),
+            lhs.offset() + lhs_start,
+            rhs.offset() + rhs_start,
+            len,
+        ),
+        (Some(lhs), None) => !contains_nulls(Some(lhs), lhs_start, len),
+        (None, Some(rhs)) => !contains_nulls(Some(rhs), rhs_start, len),
         (None, None) => true,
     }
 }
@@ -65,7 +59,7 @@ pub(super) fn equal_nulls(
 #[inline]
 pub(super) fn base_equal(lhs: &ArrayData, rhs: &ArrayData) -> bool {
     let equal_type = match (lhs.data_type(), rhs.data_type()) {
-        (DataType::Union(l_fields, _, l_mode), DataType::Union(r_fields, _, r_mode)) => {
+        (DataType::Union(l_fields, l_mode), DataType::Union(r_fields, r_mode)) => {
             l_fields == r_fields && l_mode == r_mode
         }
         (DataType::Map(l_field, l_sorted), DataType::Map(r_field, r_sorted)) => {
@@ -73,17 +67,15 @@ pub(super) fn base_equal(lhs: &ArrayData, rhs: &ArrayData) -> bool {
                 (DataType::Struct(l_fields), DataType::Struct(r_fields))
                     if l_fields.len() == 2 && r_fields.len() == 2 =>
                 {
-                    let l_key_field = l_fields.get(0).unwrap();
-                    let r_key_field = r_fields.get(0).unwrap();
-                    let l_value_field = l_fields.get(1).unwrap();
-                    let r_value_field = r_fields.get(1).unwrap();
+                    let l_key_field = &l_fields[0];
+                    let r_key_field = &r_fields[0];
+                    let l_value_field = &l_fields[1];
+                    let r_value_field = &r_fields[1];
 
                     // We don't enforce the equality of field names
-                    let data_type_equal = l_key_field.data_type()
-                        == r_key_field.data_type()
+                    let data_type_equal = l_key_field.data_type() == r_key_field.data_type()
                         && l_value_field.data_type() == r_value_field.data_type();
-                    let nullability_equal = l_key_field.is_nullable()
-                        == r_key_field.is_nullable()
+                    let nullability_equal = l_key_field.is_nullable() == r_key_field.is_nullable()
                         && l_value_field.is_nullable() == r_value_field.is_nullable();
                     let metadata_equal = l_key_field.metadata() == r_key_field.metadata()
                         && l_value_field.metadata() == r_value_field.metadata();

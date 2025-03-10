@@ -19,15 +19,14 @@ use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
 use std::borrow::Cow;
 
 use crate::path::DELIMITER_BYTE;
-use snafu::Snafu;
 
 /// Error returned by [`PathPart::parse`]
-#[derive(Debug, Snafu)]
-#[snafu(display(
+#[derive(Debug, thiserror::Error)]
+#[error(
     "Encountered illegal character sequence \"{}\" whilst parsing path segment \"{}\"",
     illegal,
     segment
-))]
+)]
 #[allow(missing_copy_implementations)]
 pub struct InvalidPart {
     segment: String,
@@ -37,8 +36,10 @@ pub struct InvalidPart {
 /// The PathPart type exists to validate the directory/file names that form part
 /// of a path.
 ///
-/// A PathPart instance is guaranteed to to contain no illegal characters (e.g. `/`)
-/// as it can only be constructed by going through the `from` impl.
+/// A [`PathPart`] is guaranteed to:
+///
+/// * Contain no ASCII control characters or `/`
+/// * Not be a relative path segment, i.e. `.` or `..`
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Hash)]
 pub struct PathPart<'a> {
     pub(super) raw: Cow<'a, str>,
@@ -54,19 +55,12 @@ impl<'a> PathPart<'a> {
             });
         }
 
-        for (idx, b) in segment.as_bytes().iter().cloned().enumerate() {
-            // A percent character is always valid, even if not
-            // followed by a valid 2-digit hex code
-            // https://url.spec.whatwg.org/#percent-encoded-bytes
-            if b == b'%' {
-                continue;
-            }
-
-            if !b.is_ascii() || should_percent_encode(b) {
+        for c in segment.chars() {
+            if c.is_ascii_control() || c == '/' {
                 return Err(InvalidPart {
                     segment: segment.to_string(),
                     // This is correct as only single byte characters up to this point
-                    illegal: segment.chars().nth(idx).unwrap().to_string(),
+                    illegal: c.to_string(),
                 });
             }
         }
@@ -75,10 +69,6 @@ impl<'a> PathPart<'a> {
             raw: segment.into(),
         })
     }
-}
-
-fn should_percent_encode(c: u8) -> bool {
-    percent_encode(&[c], INVALID).next().unwrap().len() != 1
 }
 
 /// Characters we want to encode.
@@ -135,7 +125,7 @@ impl From<String> for PathPart<'static> {
     }
 }
 
-impl<'a> AsRef<str> for PathPart<'a> {
+impl AsRef<str> for PathPart<'_> {
     fn as_ref(&self) -> &str {
         self.raw.as_ref()
     }

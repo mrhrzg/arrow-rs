@@ -17,12 +17,13 @@
 
 //! Contains structs and methods to build Parquet schema and schema descriptors.
 
-use std::{collections::HashMap, convert::From, fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
+use crate::file::metadata::HeapSize;
 use crate::format::SchemaElement;
 
 use crate::basic::{
-    ConvertedType, LogicalType, Repetition, TimeUnit, Type as PhysicalType,
+    ColumnOrder, ConvertedType, LogicalType, Repetition, SortOrder, TimeUnit, Type as PhysicalType,
 };
 use crate::errors::{ParquetError, Result};
 
@@ -37,30 +38,47 @@ pub type SchemaDescPtr = Arc<SchemaDescriptor>;
 pub type ColumnDescPtr = Arc<ColumnDescriptor>;
 
 /// Representation of a Parquet type.
+///
 /// Used to describe primitive leaf fields and structs, including top-level schema.
-/// Note that the top-level schema type is represented using `GroupType` whose
+///
+/// Note that the top-level schema is represented using [`Type::GroupType`] whose
 /// repetition is `None`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Type {
+    /// Represents a primitive leaf field.
     PrimitiveType {
+        /// Basic information about the type.
         basic_info: BasicTypeInfo,
+        /// Physical type of this primitive type.
         physical_type: PhysicalType,
+        /// Length of this type.
         type_length: i32,
+        /// Scale of this type.
         scale: i32,
+        /// Precision of this type.
         precision: i32,
     },
+    /// Represents a group of fields (similar to struct).
     GroupType {
+        /// Basic information about the type.
         basic_info: BasicTypeInfo,
+        /// Fields of this group type.
         fields: Vec<TypePtr>,
     },
 }
 
+impl HeapSize for Type {
+    fn heap_size(&self) -> usize {
+        match self {
+            Type::PrimitiveType { basic_info, .. } => basic_info.heap_size(),
+            Type::GroupType { basic_info, fields } => basic_info.heap_size() + fields.heap_size(),
+        }
+    }
+}
+
 impl Type {
     /// Creates primitive type builder with provided field name and physical type.
-    pub fn primitive_type_builder(
-        name: &str,
-        physical_type: PhysicalType,
-    ) -> PrimitiveTypeBuilder {
+    pub fn primitive_type_builder(name: &str, physical_type: PhysicalType) -> PrimitiveTypeBuilder {
         PrimitiveTypeBuilder::new(name, physical_type)
     }
 
@@ -127,8 +145,7 @@ impl Type {
     /// This method can be used to check if projected columns are part of the root schema.
     pub fn check_contains(&self, sub_type: &Type) -> bool {
         // Names match, and repetitions match or not set for both
-        let basic_match = self.get_basic_info().name()
-            == sub_type.get_basic_info().name()
+        let basic_match = self.get_basic_info().name() == sub_type.get_basic_info().name()
             && (self.is_schema() && sub_type.is_schema()
                 || !self.is_schema()
                     && !sub_type.is_schema()
@@ -180,10 +197,33 @@ impl Type {
     }
 
     /// Returns `true` if this type is repeated or optional.
-    /// If this type doesn't have repetition defined, we still treat it as optional.
+    /// If this type doesn't have repetition defined, we treat it as required.
     pub fn is_optional(&self) -> bool {
         self.get_basic_info().has_repetition()
             && self.get_basic_info().repetition() != Repetition::REQUIRED
+    }
+
+    /// Returns `true` if this type is annotated as a list.
+    pub(crate) fn is_list(&self) -> bool {
+        if self.is_group() {
+            let basic_info = self.get_basic_info();
+            if let Some(logical_type) = basic_info.logical_type() {
+                return logical_type == LogicalType::List;
+            }
+            return basic_info.converted_type() == ConvertedType::LIST;
+        }
+        false
+    }
+
+    /// Returns `true` if this type is a group with a single child field that is `repeated`.
+    pub(crate) fn has_single_repeated_child(&self) -> bool {
+        if self.is_group() {
+            let children = self.get_fields();
+            return children.len() == 1
+                && children[0].get_basic_info().has_repetition()
+                && children[0].get_basic_info().repetition() == Repetition::REPEATED;
+        }
+        false
     }
 }
 
@@ -218,53 +258,52 @@ impl<'a> PrimitiveTypeBuilder<'a> {
         }
     }
 
-    /// Sets [`Repetition`](crate::basic::Repetition) for this field and returns itself.
-    pub fn with_repetition(mut self, repetition: Repetition) -> Self {
-        self.repetition = repetition;
-        self
+    /// Sets [`Repetition`] for this field and returns itself.
+    pub fn with_repetition(self, repetition: Repetition) -> Self {
+        Self { repetition, ..self }
     }
 
-    /// Sets [`ConvertedType`](crate::basic::ConvertedType) for this field and returns itself.
-    pub fn with_converted_type(mut self, converted_type: ConvertedType) -> Self {
-        self.converted_type = converted_type;
-        self
+    /// Sets [`ConvertedType`] for this field and returns itself.
+    pub fn with_converted_type(self, converted_type: ConvertedType) -> Self {
+        Self {
+            converted_type,
+            ..self
+        }
     }
 
-    /// Sets [`LogicalType`](crate::basic::LogicalType) for this field and returns itself.
+    /// Sets [`LogicalType`] for this field and returns itself.
     /// If only the logical type is populated for a primitive type, the converted type
     /// will be automatically populated, and can thus be omitted.
-    pub fn with_logical_type(mut self, logical_type: Option<LogicalType>) -> Self {
-        self.logical_type = logical_type;
-        self
+    pub fn with_logical_type(self, logical_type: Option<LogicalType>) -> Self {
+        Self {
+            logical_type,
+            ..self
+        }
     }
 
     /// Sets type length and returns itself.
     /// This is only applied to FIXED_LEN_BYTE_ARRAY and INT96 (INTERVAL) types, because
     /// they maintain fixed size underlying byte array.
     /// By default, value is `0`.
-    pub fn with_length(mut self, length: i32) -> Self {
-        self.length = length;
-        self
+    pub fn with_length(self, length: i32) -> Self {
+        Self { length, ..self }
     }
 
     /// Sets precision for Parquet DECIMAL physical type and returns itself.
     /// By default, it equals to `0` and used only for decimal context.
-    pub fn with_precision(mut self, precision: i32) -> Self {
-        self.precision = precision;
-        self
+    pub fn with_precision(self, precision: i32) -> Self {
+        Self { precision, ..self }
     }
 
     /// Sets scale for Parquet DECIMAL physical type and returns itself.
     /// By default, it equals to `0` and used only for decimal context.
-    pub fn with_scale(mut self, scale: i32) -> Self {
-        self.scale = scale;
-        self
+    pub fn with_scale(self, scale: i32) -> Self {
+        Self { scale, ..self }
     }
 
     /// Sets optional field id and returns itself.
-    pub fn with_id(mut self, id: i32) -> Self {
-        self.id = Some(id);
-        self
+    pub fn with_id(self, id: Option<i32>) -> Self {
+        Self { id, ..self }
     }
 
     /// Creates a new `PrimitiveType` instance from the collected attributes.
@@ -287,93 +326,102 @@ impl<'a> PrimitiveTypeBuilder<'a> {
             ));
         }
 
-        match &self.logical_type {
-            Some(logical_type) => {
-                // If a converted type is populated, check that it is consistent with
-                // its logical type
-                if self.converted_type != ConvertedType::NONE {
-                    if ConvertedType::from(self.logical_type.clone())
-                        != self.converted_type
-                    {
-                        return Err(general_err!(
-                            "Logical type {:?} is incompatible with converted type {} for field '{}'",
-                            logical_type,
-                            self.converted_type,
-                            self.name
-                        ));
-                    }
-                } else {
-                    // Populate the converted type for backwards compatibility
-                    basic_info.converted_type = self.logical_type.clone().into();
+        if let Some(logical_type) = &self.logical_type {
+            // If a converted type is populated, check that it is consistent with
+            // its logical type
+            if self.converted_type != ConvertedType::NONE {
+                if ConvertedType::from(self.logical_type.clone()) != self.converted_type {
+                    return Err(general_err!(
+                        "Logical type {:?} is incompatible with converted type {} for field '{}'",
+                        logical_type,
+                        self.converted_type,
+                        self.name
+                    ));
                 }
-                // Check that logical type and physical type are compatible
-                match (logical_type, self.physical_type) {
-                    (LogicalType::Map, _) | (LogicalType::List, _) => {
+            } else {
+                // Populate the converted type for backwards compatibility
+                basic_info.converted_type = self.logical_type.clone().into();
+            }
+            // Check that logical type and physical type are compatible
+            match (logical_type, self.physical_type) {
+                (LogicalType::Map, _) | (LogicalType::List, _) => {
+                    return Err(general_err!(
+                        "{:?} cannot be applied to a primitive type for field '{}'",
+                        logical_type,
+                        self.name
+                    ));
+                }
+                (LogicalType::Enum, PhysicalType::BYTE_ARRAY) => {}
+                (LogicalType::Decimal { scale, precision }, _) => {
+                    // Check that scale and precision are consistent with legacy values
+                    if *scale != self.scale {
                         return Err(general_err!(
-                            "{:?} cannot be applied to a primitive type for field '{}'",
-                            logical_type,
+                            "DECIMAL logical type scale {} must match self.scale {} for field '{}'",
+                            scale,
+                            self.scale,
                             self.name
                         ));
                     }
-                    (LogicalType::Enum, PhysicalType::BYTE_ARRAY) => {}
-                    (LogicalType::Decimal { scale, precision }, _) => {
-                        // Check that scale and precision are consistent with legacy values
-                        if *scale != self.scale {
-                            return Err(general_err!(
-                                "DECIMAL logical type scale {} must match self.scale {} for field '{}'",
-                                scale,
-                                self.scale,
-                                self.name
-                            ));
-                        }
-                        if *precision != self.precision {
-                            return Err(general_err!(
-                                "DECIMAL logical type precision {} must match self.precision {} for field '{}'",
-                                precision,
-                                self.precision,
-                                self.name
-                            ));
-                        }
-                        self.check_decimal_precision_scale()?;
-                    }
-                    (LogicalType::Date, PhysicalType::INT32) => {}
-                    (
-                        LogicalType::Time {
-                            unit: TimeUnit::MILLIS(_),
-                            ..
-                        },
-                        PhysicalType::INT32,
-                    ) => {}
-                    (LogicalType::Time { unit, .. }, PhysicalType::INT64) => {
-                        if *unit == TimeUnit::MILLIS(Default::default()) {
-                            return Err(general_err!(
-                                "Cannot use millisecond unit on INT64 type for field '{}'",
-                                self.name
-                            ));
-                        }
-                    }
-                    (LogicalType::Timestamp { .. }, PhysicalType::INT64) => {}
-                    (LogicalType::Integer { bit_width, .. }, PhysicalType::INT32)
-                        if *bit_width <= 32 => {}
-                    (LogicalType::Integer { bit_width, .. }, PhysicalType::INT64)
-                        if *bit_width == 64 => {}
-                    // Null type
-                    (LogicalType::Unknown, PhysicalType::INT32) => {}
-                    (LogicalType::String, PhysicalType::BYTE_ARRAY) => {}
-                    (LogicalType::Json, PhysicalType::BYTE_ARRAY) => {}
-                    (LogicalType::Bson, PhysicalType::BYTE_ARRAY) => {}
-                    (LogicalType::Uuid, PhysicalType::FIXED_LEN_BYTE_ARRAY) => {}
-                    (a, b) => {
+                    if *precision != self.precision {
                         return Err(general_err!(
-                            "Cannot annotate {:?} from {} for field '{}'",
-                            a,
-                            b,
+                            "DECIMAL logical type precision {} must match self.precision {} for field '{}'",
+                            precision,
+                            self.precision,
                             self.name
-                        ))
+                        ));
                     }
+                    self.check_decimal_precision_scale()?;
+                }
+                (LogicalType::Date, PhysicalType::INT32) => {}
+                (
+                    LogicalType::Time {
+                        unit: TimeUnit::MILLIS(_),
+                        ..
+                    },
+                    PhysicalType::INT32,
+                ) => {}
+                (LogicalType::Time { unit, .. }, PhysicalType::INT64) => {
+                    if *unit == TimeUnit::MILLIS(Default::default()) {
+                        return Err(general_err!(
+                            "Cannot use millisecond unit on INT64 type for field '{}'",
+                            self.name
+                        ));
+                    }
+                }
+                (LogicalType::Timestamp { .. }, PhysicalType::INT64) => {}
+                (LogicalType::Integer { bit_width, .. }, PhysicalType::INT32)
+                    if *bit_width <= 32 => {}
+                (LogicalType::Integer { bit_width, .. }, PhysicalType::INT64)
+                    if *bit_width == 64 => {}
+                // Null type
+                (LogicalType::Unknown, PhysicalType::INT32) => {}
+                (LogicalType::String, PhysicalType::BYTE_ARRAY) => {}
+                (LogicalType::Json, PhysicalType::BYTE_ARRAY) => {}
+                (LogicalType::Bson, PhysicalType::BYTE_ARRAY) => {}
+                (LogicalType::Uuid, PhysicalType::FIXED_LEN_BYTE_ARRAY) if self.length == 16 => {}
+                (LogicalType::Uuid, PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
+                    return Err(general_err!(
+                        "UUID cannot annotate field '{}' because it is not a FIXED_LEN_BYTE_ARRAY(16) field",
+                        self.name
+                    ))
+                }
+                (LogicalType::Float16, PhysicalType::FIXED_LEN_BYTE_ARRAY)
+                    if self.length == 2 => {}
+                (LogicalType::Float16, PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
+                    return Err(general_err!(
+                        "FLOAT16 cannot annotate field '{}' because it is not a FIXED_LEN_BYTE_ARRAY(2) field",
+                        self.name
+                    ))
+                }
+                (a, b) => {
+                    return Err(general_err!(
+                        "Cannot annotate {:?} from {} for field '{}'",
+                        a,
+                        b,
+                        self.name
+                    ))
                 }
             }
-            None => {}
         }
 
         match self.converted_type {
@@ -420,9 +468,7 @@ impl<'a> PrimitiveTypeBuilder<'a> {
                 }
             }
             ConvertedType::INTERVAL => {
-                if self.physical_type != PhysicalType::FIXED_LEN_BYTE_ARRAY
-                    || self.length != 12
-                {
+                if self.physical_type != PhysicalType::FIXED_LEN_BYTE_ARRAY || self.length != 12 {
                     return Err(general_err!(
                         "INTERVAL cannot annotate field '{}' because it is not a FIXED_LEN_BYTE_ARRAY(12) field",
                         self.name
@@ -431,7 +477,10 @@ impl<'a> PrimitiveTypeBuilder<'a> {
             }
             ConvertedType::ENUM => {
                 if self.physical_type != PhysicalType::BYTE_ARRAY {
-                    return Err(general_err!("ENUM cannot annotate field '{}' because it is not a BYTE_ARRAY field", self.name));
+                    return Err(general_err!(
+                        "ENUM cannot annotate field '{}' because it is not a BYTE_ARRAY field",
+                        self.name
+                    ));
                 }
             }
             _ => {
@@ -507,8 +556,11 @@ impl<'a> PrimitiveTypeBuilder<'a> {
                 }
             }
             PhysicalType::FIXED_LEN_BYTE_ARRAY => {
-                let max_precision =
-                    (2f64.powi(8 * self.length - 1) - 1f64).log10().floor() as i32;
+                let length = self
+                    .length
+                    .checked_mul(8)
+                    .ok_or(general_err!("Invalid length {} for Decimal", self.length))?;
+                let max_precision = (2f64.powi(length - 1) - 1f64).log10().floor() as i32;
 
                 if self.precision > max_precision {
                     return Err(general_err!(
@@ -552,35 +604,37 @@ impl<'a> GroupTypeBuilder<'a> {
         }
     }
 
-    /// Sets [`Repetition`](crate::basic::Repetition) for this field and returns itself.
+    /// Sets [`Repetition`] for this field and returns itself.
     pub fn with_repetition(mut self, repetition: Repetition) -> Self {
         self.repetition = Some(repetition);
         self
     }
 
-    /// Sets [`ConvertedType`](crate::basic::ConvertedType) for this field and returns itself.
-    pub fn with_converted_type(mut self, converted_type: ConvertedType) -> Self {
-        self.converted_type = converted_type;
-        self
+    /// Sets [`ConvertedType`] for this field and returns itself.
+    pub fn with_converted_type(self, converted_type: ConvertedType) -> Self {
+        Self {
+            converted_type,
+            ..self
+        }
     }
 
-    /// Sets [`LogicalType`](crate::basic::LogicalType) for this field and returns itself.
-    pub fn with_logical_type(mut self, logical_type: Option<LogicalType>) -> Self {
-        self.logical_type = logical_type;
-        self
+    /// Sets [`LogicalType`] for this field and returns itself.
+    pub fn with_logical_type(self, logical_type: Option<LogicalType>) -> Self {
+        Self {
+            logical_type,
+            ..self
+        }
     }
 
     /// Sets a list of fields that should be child nodes of this field.
     /// Returns updated self.
-    pub fn with_fields(mut self, fields: &mut Vec<TypePtr>) -> Self {
-        self.fields.append(fields);
-        self
+    pub fn with_fields(self, fields: Vec<TypePtr>) -> Self {
+        Self { fields, ..self }
     }
 
     /// Sets optional field id and returns itself.
-    pub fn with_id(mut self, id: i32) -> Self {
-        self.id = Some(id);
-        self
+    pub fn with_id(self, id: Option<i32>) -> Self {
+        Self { id, ..self }
     }
 
     /// Creates a new `GroupType` instance from the gathered attributes.
@@ -614,6 +668,13 @@ pub struct BasicTypeInfo {
     id: Option<i32>,
 }
 
+impl HeapSize for BasicTypeInfo {
+    fn heap_size(&self) -> usize {
+        // no heap allocations in any other subfield
+        self.name.heap_size()
+    }
+}
+
 impl BasicTypeInfo {
     /// Returns field name.
     pub fn name(&self) -> &str {
@@ -627,18 +688,18 @@ impl BasicTypeInfo {
         self.repetition.is_some()
     }
 
-    /// Returns [`Repetition`](crate::basic::Repetition) value for the type.
+    /// Returns [`Repetition`] value for the type.
     pub fn repetition(&self) -> Repetition {
         assert!(self.repetition.is_some());
         self.repetition.unwrap()
     }
 
-    /// Returns [`ConvertedType`](crate::basic::ConvertedType) value for the type.
+    /// Returns [`ConvertedType`] value for the type.
     pub fn converted_type(&self) -> ConvertedType {
         self.converted_type
     }
 
-    /// Returns [`LogicalType`](crate::basic::LogicalType) value for the type.
+    /// Returns [`LogicalType`] value for the type.
     pub fn logical_type(&self) -> Option<LogicalType> {
         // Unlike ConvertedType, LogicalType cannot implement Copy, thus we clone it
         self.logical_type.clone()
@@ -659,10 +720,33 @@ impl BasicTypeInfo {
 // ----------------------------------------------------------------------
 // Parquet descriptor definitions
 
-/// Represents a path in a nested schema
+/// Represents the location of a column in a Parquet schema
+///
+/// # Example: refer to column named `'my_column'`
+/// ```
+/// # use parquet::schema::types::ColumnPath;
+/// let column_path = ColumnPath::from("my_column");
+/// ```
+///
+/// # Example: refer to column named `c` in a nested struct `{a: {b: {c: ...}}}`
+/// ```
+/// # use parquet::schema::types::ColumnPath;
+/// // form path 'a.b.c'
+/// let column_path = ColumnPath::from(vec![
+///   String::from("a"),
+///   String::from("b"),
+///   String::from("c")
+/// ]);
+/// ```
 #[derive(Clone, PartialEq, Debug, Eq, Hash)]
 pub struct ColumnPath {
     parts: Vec<String>,
+}
+
+impl HeapSize for ColumnPath {
+    fn heap_size(&self) -> usize {
+        self.parts.heap_size()
+    }
 }
 
 impl ColumnPath {
@@ -697,6 +781,7 @@ impl ColumnPath {
         self.parts.append(&mut tail);
     }
 
+    /// Returns a slice of path components.
     pub fn parts(&self) -> &[String] {
         &self.parts
     }
@@ -714,7 +799,7 @@ impl From<Vec<String>> for ColumnPath {
     }
 }
 
-impl<'a> From<&'a str> for ColumnPath {
+impl From<&str> for ColumnPath {
     fn from(single_path: &str) -> Self {
         let s = String::from(single_path);
         ColumnPath::from(s)
@@ -734,22 +819,29 @@ impl AsRef<[String]> for ColumnPath {
     }
 }
 
-/// A descriptor for leaf-level primitive columns.
-/// This encapsulates information such as definition and repetition levels and is used to
+/// Physical type for leaf-level primitive columns.
+///
+/// Also includes the maximum definition and repetition levels required to
 /// re-assemble nested data.
 #[derive(Debug, PartialEq)]
 pub struct ColumnDescriptor {
-    // The "leaf" primitive type of this column
+    /// The "leaf" primitive type of this column
     primitive_type: TypePtr,
 
-    // The maximum definition level for this column
+    /// The maximum definition level for this column
     max_def_level: i16,
 
-    // The maximum repetition level for this column
+    /// The maximum repetition level for this column
     max_rep_level: i16,
 
-    // The path of this column. For instance, "a.b.c.d".
+    /// The path of this column. For instance, "a.b.c.d".
     path: ColumnPath,
+}
+
+impl HeapSize for ColumnDescriptor {
+    fn heap_size(&self) -> usize {
+        self.primitive_type.heap_size() + self.path.heap_size()
+    }
 }
 
 impl ColumnDescriptor {
@@ -785,12 +877,12 @@ impl ColumnDescriptor {
         &self.path
     }
 
-    /// Returns self type [`Type`](crate::schema::types::Type) for this leaf column.
+    /// Returns self type [`Type`] for this leaf column.
     pub fn self_type(&self) -> &Type {
         self.primitive_type.as_ref()
     }
 
-    /// Returns self type [`TypePtr`](crate::schema::types::TypePtr)  for this leaf
+    /// Returns self type [`TypePtr`]  for this leaf
     /// column.
     pub fn self_type_ptr(&self) -> TypePtr {
         self.primitive_type.clone()
@@ -801,12 +893,12 @@ impl ColumnDescriptor {
         self.primitive_type.name()
     }
 
-    /// Returns [`ConvertedType`](crate::basic::ConvertedType) for this column.
+    /// Returns [`ConvertedType`] for this column.
     pub fn converted_type(&self) -> ConvertedType {
         self.primitive_type.get_basic_info().converted_type()
     }
 
-    /// Returns [`LogicalType`](crate::basic::LogicalType) for this column.
+    /// Returns [`LogicalType`] for this column.
     pub fn logical_type(&self) -> Option<LogicalType> {
         self.primitive_type.get_basic_info().logical_type()
     }
@@ -846,26 +938,70 @@ impl ColumnDescriptor {
             _ => panic!("Expected primitive type!"),
         }
     }
+
+    /// Returns the sort order for this column
+    pub fn sort_order(&self) -> SortOrder {
+        ColumnOrder::get_sort_order(
+            self.logical_type(),
+            self.converted_type(),
+            self.physical_type(),
+        )
+    }
 }
 
-/// A schema descriptor. This encapsulates the top-level schemas for all the columns,
-/// as well as all descriptors for all the primitive columns.
+/// Schema of a Parquet file.
+///
+/// Encapsulates the file's schema ([`Type`]) and [`ColumnDescriptor`]s for
+/// each primitive (leaf) column.
+///
+/// # Example
+/// ```
+/// # use std::sync::Arc;
+/// use parquet::schema::types::{SchemaDescriptor, Type};
+/// use parquet::basic; // note there are two `Type`s that are different
+/// // Schema for a table with two columns: "a" (int64) and "b" (int32, stored as a date)
+/// let descriptor = SchemaDescriptor::new(
+///   Arc::new(
+///     Type::group_type_builder("my_schema")
+///       .with_fields(vec![
+///         Arc::new(
+///          Type::primitive_type_builder("a", basic::Type::INT64)
+///           .build().unwrap()
+///         ),
+///         Arc::new(
+///          Type::primitive_type_builder("b", basic::Type::INT32)
+///           .with_converted_type(basic::ConvertedType::DATE)
+///           .with_logical_type(Some(basic::LogicalType::Date))
+///           .build().unwrap()
+///         ),
+///      ])
+///      .build().unwrap()
+///   )
+/// );
+/// ```
 #[derive(PartialEq)]
 pub struct SchemaDescriptor {
-    // The top-level schema (the "message" type).
-    // This must be a `GroupType` where each field is a root column type in the schema.
+    /// The top-level logical schema (the "message" type).
+    ///
+    /// This must be a [`Type::GroupType`] where each field is a root
+    /// column type in the schema.
     schema: TypePtr,
 
-    // All the descriptors for primitive columns in this schema, constructed from
-    // `schema` in DFS order.
+    /// The descriptors for the physical type of each leaf column in this schema
+    ///
+    /// Constructed from `schema` in DFS order.
     leaves: Vec<ColumnDescPtr>,
 
-    // Mapping from a leaf column's index to the root column index that it
-    // comes from. For instance: the leaf `a.b.c.d` would have a link back to `a`:
-    // -- a  <-----+
-    // -- -- b     |
-    // -- -- -- c  |
-    // -- -- -- -- d
+    /// Mapping from a leaf column's index to the root column index that it
+    /// comes from.
+    ///
+    /// For instance: the leaf `a.b.c.d` would have a link back to `a`:
+    /// ```text
+    /// -- a  <-----+
+    /// -- -- b     |
+    /// -- -- -- c  |
+    /// -- -- -- -- d
+    /// ```
     leaf_to_base: Vec<usize>,
 }
 
@@ -875,6 +1011,13 @@ impl fmt::Debug for SchemaDescriptor {
         f.debug_struct("SchemaDescriptor")
             .field("schema", &self.schema)
             .finish()
+    }
+}
+
+// Need to implement HeapSize in this module as the fields are private
+impl HeapSize for SchemaDescriptor {
+    fn heap_size(&self) -> usize {
+        self.schema.heap_size() + self.leaves.heap_size() + self.leaf_to_base.heap_size()
     }
 }
 
@@ -917,14 +1060,13 @@ impl SchemaDescriptor {
         self.leaves.len()
     }
 
-    /// Returns column root [`Type`](crate::schema::types::Type) for a leaf position.
+    /// Returns column root [`Type`] for a leaf position.
     pub fn get_column_root(&self, i: usize) -> &Type {
         let result = self.column_root_of(i);
         result.as_ref()
     }
 
-    /// Returns column root [`Type`](crate::schema::types::Type) pointer for a leaf
-    /// position.
+    /// Returns column root [`Type`] pointer for a leaf position.
     pub fn get_column_root_ptr(&self, i: usize) -> TypePtr {
         let result = self.column_root_of(i);
         result.clone()
@@ -939,20 +1081,22 @@ impl SchemaDescriptor {
             self.leaves.len()
         );
 
-        *self.leaf_to_base.get(leaf).unwrap_or_else(|| {
-            panic!("Expected a value for index {} but found None", leaf)
-        })
+        *self
+            .leaf_to_base
+            .get(leaf)
+            .unwrap_or_else(|| panic!("Expected a value for index {leaf} but found None"))
     }
 
     fn column_root_of(&self, i: usize) -> &TypePtr {
         &self.schema.get_fields()[self.get_column_root_idx(i)]
     }
 
-    /// Returns schema as [`Type`](crate::schema::types::Type).
+    /// Returns schema as [`Type`].
     pub fn root_schema(&self) -> &Type {
         self.schema.as_ref()
     }
 
+    /// Returns schema as [`TypePtr`] for cheap cloning.
     pub fn root_schema_ptr(&self) -> TypePtr {
         self.schema.clone()
     }
@@ -1031,22 +1175,35 @@ pub fn from_thrift(elements: &[SchemaElement]) -> Result<TypePtr> {
         ));
     }
 
+    if !schema_nodes[0].is_group() {
+        return Err(general_err!("Expected root node to be a group type"));
+    }
+
     Ok(schema_nodes.remove(0))
+}
+
+/// Checks if the logical type is valid.
+fn check_logical_type(logical_type: &Option<LogicalType>) -> Result<()> {
+    if let Some(LogicalType::Integer { bit_width, .. }) = *logical_type {
+        if bit_width != 8 && bit_width != 16 && bit_width != 32 && bit_width != 64 {
+            return Err(general_err!(
+                "Bit width must be 8, 16, 32, or 64 for Integer logical type"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Constructs a new Type from the `elements`, starting at index `index`.
 /// The first result is the starting index for the next Type after this one. If it is
 /// equal to `elements.len()`, then this Type is the last one.
 /// The second result is the result Type.
-fn from_thrift_helper(
-    elements: &[SchemaElement],
-    index: usize,
-) -> Result<(usize, TypePtr)> {
+fn from_thrift_helper(elements: &[SchemaElement], index: usize) -> Result<(usize, TypePtr)> {
     // Whether or not the current node is root (message type).
     // There is only one message type node in the schema tree.
     let is_root_node = index == 0;
 
-    if index > elements.len() {
+    if index >= elements.len() {
         return Err(general_err!(
             "Index out of bound, index = {}, len = {}",
             index,
@@ -1054,6 +1211,13 @@ fn from_thrift_helper(
         ));
     }
     let element = &elements[index];
+
+    // Check for empty schema
+    if let (true, None | Some(0)) = (is_root_node, element.num_children) {
+        let builder = Type::group_type_builder(&element.name);
+        return Ok((index + 1, Arc::new(builder.build().unwrap())));
+    }
+
     let converted_type = ConvertedType::try_from(element.converted_type)?;
     // LogicalType is only present in v2 Parquet files. ConvertedType is always
     // populated, regardless of the version of the file (v1 or v2).
@@ -1061,6 +1225,9 @@ fn from_thrift_helper(
         .logical_type
         .as_ref()
         .map(|value| LogicalType::from(value.clone()));
+
+    check_logical_type(&logical_type)?;
+
     let field_id = elements[index].field_id;
     match elements[index].num_children {
         // From parquet-format:
@@ -1075,24 +1242,39 @@ fn from_thrift_helper(
                     "Repetition level must be defined for a primitive type"
                 ));
             }
-            let repetition =
-                Repetition::try_from(elements[index].repetition_type.unwrap())?;
-            let physical_type = PhysicalType::try_from(elements[index].type_.unwrap())?;
-            let length = elements[index].type_length.unwrap_or(-1);
-            let scale = elements[index].scale.unwrap_or(-1);
-            let precision = elements[index].precision.unwrap_or(-1);
-            let name = &elements[index].name;
-            let mut builder = Type::primitive_type_builder(name, physical_type)
-                .with_repetition(repetition)
-                .with_converted_type(converted_type)
-                .with_logical_type(logical_type)
-                .with_length(length)
-                .with_precision(precision)
-                .with_scale(scale);
-            if let Some(id) = field_id {
-                builder = builder.with_id(id);
+            let repetition = Repetition::try_from(elements[index].repetition_type.unwrap())?;
+            if let Some(type_) = elements[index].type_ {
+                let physical_type = PhysicalType::try_from(type_)?;
+                let length = elements[index].type_length.unwrap_or(-1);
+                let scale = elements[index].scale.unwrap_or(-1);
+                let precision = elements[index].precision.unwrap_or(-1);
+                let name = &elements[index].name;
+                let builder = Type::primitive_type_builder(name, physical_type)
+                    .with_repetition(repetition)
+                    .with_converted_type(converted_type)
+                    .with_logical_type(logical_type)
+                    .with_length(length)
+                    .with_precision(precision)
+                    .with_scale(scale)
+                    .with_id(field_id);
+                Ok((index + 1, Arc::new(builder.build()?)))
+            } else {
+                let mut builder = Type::group_type_builder(&elements[index].name)
+                    .with_converted_type(converted_type)
+                    .with_logical_type(logical_type)
+                    .with_id(field_id);
+                if !is_root_node {
+                    // Sometimes parquet-cpp and parquet-mr set repetition level REQUIRED or
+                    // REPEATED for root node.
+                    //
+                    // We only set repetition for group types that are not top-level message
+                    // type. According to parquet-format:
+                    //   Root of the schema does not have a repetition_type.
+                    //   All other types must have one.
+                    builder = builder.with_repetition(repetition);
+                }
+                Ok((index + 1, Arc::new(builder.build().unwrap())))
             }
-            Ok((index + 1, Arc::new(builder.build()?)))
         }
         Some(n) => {
             let repetition = elements[index]
@@ -1103,7 +1285,7 @@ fn from_thrift_helper(
             let mut fields = vec![];
             let mut next_index = index + 1;
             for _ in 0..n {
-                let child_result = from_thrift_helper(elements, next_index as usize)?;
+                let child_result = from_thrift_helper(elements, next_index)?;
                 next_index = child_result.0;
                 fields.push(child_result.1);
             }
@@ -1111,7 +1293,8 @@ fn from_thrift_helper(
             let mut builder = Type::group_type_builder(&elements[index].name)
                 .with_converted_type(converted_type)
                 .with_logical_type(logical_type)
-                .with_fields(&mut fields);
+                .with_fields(fields)
+                .with_id(field_id);
             if let Some(rep) = repetition {
                 // Sometimes parquet-cpp and parquet-mr set repetition level REQUIRED or
                 // REPEATED for root node.
@@ -1123,9 +1306,6 @@ fn from_thrift_helper(
                 if !is_root_node {
                     builder = builder.with_repetition(rep);
                 }
-            }
-            if let Some(id) = field_id {
-                builder = builder.with_id(id);
             }
             Ok((next_index, Arc::new(builder.build().unwrap())))
         }
@@ -1232,7 +1412,7 @@ mod tests {
                 bit_width: 32,
                 is_signed: true,
             }))
-            .with_id(0)
+            .with_id(Some(0))
             .build();
         assert!(result.is_ok());
 
@@ -1269,7 +1449,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: Cannot annotate Integer { bit_width: 8, is_signed: true } from INT64 for field 'foo'"
             );
         }
@@ -1282,7 +1462,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: BSON cannot annotate field 'foo' because it is not a BYTE_ARRAY field"
             );
         }
@@ -1296,7 +1476,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: DECIMAL can only annotate INT32, INT64, BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY"
             );
         }
@@ -1313,7 +1493,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: DECIMAL logical type scale 32 must match self.scale -1 for field 'foo'"
             );
         }
@@ -1327,7 +1507,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: Invalid DECIMAL precision: -1"
             );
         }
@@ -1341,7 +1521,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: Invalid DECIMAL precision: 0"
             );
         }
@@ -1354,7 +1534,7 @@ mod tests {
             .build();
         assert!(result.is_err());
         if let Err(e) = result {
-            assert_eq!(format!("{}", e), "Parquet error: Invalid DECIMAL scale: -1");
+            assert_eq!(format!("{e}"), "Parquet error: Invalid DECIMAL scale: -1");
         }
 
         result = Type::primitive_type_builder("foo", PhysicalType::BYTE_ARRAY)
@@ -1366,7 +1546,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: Invalid DECIMAL: scale (2) cannot be greater than precision (1)"
             );
         }
@@ -1389,7 +1569,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: Cannot represent INT32 as DECIMAL with precision 18"
             );
         }
@@ -1403,7 +1583,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: Cannot represent INT64 as DECIMAL with precision 32"
             );
         }
@@ -1418,7 +1598,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: Cannot represent FIXED_LEN_BYTE_ARRAY as DECIMAL with length 5 and precision 12. The max precision can only be 11"
             );
         }
@@ -1430,7 +1610,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: UINT_8 cannot annotate field 'foo' because it is not a INT32 field"
             );
         }
@@ -1442,7 +1622,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: TIME_MICROS cannot annotate field 'foo' because it is not a INT64 field"
             );
         }
@@ -1454,7 +1634,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: INTERVAL cannot annotate field 'foo' because it is not a FIXED_LEN_BYTE_ARRAY(12) field"
             );
         }
@@ -1467,7 +1647,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: INTERVAL cannot annotate field 'foo' because it is not a FIXED_LEN_BYTE_ARRAY(12) field"
             );
         }
@@ -1479,7 +1659,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: ENUM cannot annotate field 'foo' because it is not a BYTE_ARRAY field"
             );
         }
@@ -1491,7 +1671,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: MAP cannot be applied to primitive field 'foo'"
             );
         }
@@ -1504,8 +1684,57 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: Invalid FIXED_LEN_BYTE_ARRAY length: -1 for field 'foo'"
+            );
+        }
+
+        result = Type::primitive_type_builder("foo", PhysicalType::FIXED_LEN_BYTE_ARRAY)
+            .with_repetition(Repetition::REQUIRED)
+            .with_logical_type(Some(LogicalType::Float16))
+            .with_length(2)
+            .build();
+        assert!(result.is_ok());
+
+        // Can't be other than FIXED_LEN_BYTE_ARRAY for physical type
+        result = Type::primitive_type_builder("foo", PhysicalType::FLOAT)
+            .with_repetition(Repetition::REQUIRED)
+            .with_logical_type(Some(LogicalType::Float16))
+            .with_length(2)
+            .build();
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(
+                format!("{e}"),
+                "Parquet error: Cannot annotate Float16 from FLOAT for field 'foo'"
+            );
+        }
+
+        // Must have length 2
+        result = Type::primitive_type_builder("foo", PhysicalType::FIXED_LEN_BYTE_ARRAY)
+            .with_repetition(Repetition::REQUIRED)
+            .with_logical_type(Some(LogicalType::Float16))
+            .with_length(4)
+            .build();
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(
+                format!("{e}"),
+                "Parquet error: FLOAT16 cannot annotate field 'foo' because it is not a FIXED_LEN_BYTE_ARRAY(2) field"
+            );
+        }
+
+        // Must have length 16
+        result = Type::primitive_type_builder("foo", PhysicalType::FIXED_LEN_BYTE_ARRAY)
+            .with_repetition(Repetition::REQUIRED)
+            .with_logical_type(Some(LogicalType::Uuid))
+            .with_length(15)
+            .build();
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(
+                format!("{e}"),
+                "Parquet error: UUID cannot annotate field 'foo' because it is not a FIXED_LEN_BYTE_ARRAY(16) field"
             );
         }
     }
@@ -1514,22 +1743,22 @@ mod tests {
     fn test_group_type() {
         let f1 = Type::primitive_type_builder("f1", PhysicalType::INT32)
             .with_converted_type(ConvertedType::INT_32)
-            .with_id(0)
+            .with_id(Some(0))
             .build();
         assert!(f1.is_ok());
         let f2 = Type::primitive_type_builder("f2", PhysicalType::BYTE_ARRAY)
             .with_converted_type(ConvertedType::UTF8)
-            .with_id(1)
+            .with_id(Some(1))
             .build();
         assert!(f2.is_ok());
 
-        let mut fields = vec![Arc::new(f1.unwrap()), Arc::new(f2.unwrap())];
+        let fields = vec![Arc::new(f1.unwrap()), Arc::new(f2.unwrap())];
 
         let result = Type::group_type_builder("foo")
             .with_repetition(Repetition::REPEATED)
             .with_logical_type(Some(LogicalType::List))
-            .with_fields(&mut fields)
-            .with_id(1)
+            .with_fields(fields)
+            .with_id(Some(1))
             .build();
         assert!(result.is_ok());
 
@@ -1610,8 +1839,7 @@ mod tests {
             .with_repetition(Repetition::REQUIRED)
             .with_converted_type(ConvertedType::INT_64)
             .build()?;
-        let item2 =
-            Type::primitive_type_builder("item2", PhysicalType::BOOLEAN).build()?;
+        let item2 = Type::primitive_type_builder("item2", PhysicalType::BOOLEAN).build()?;
         let item3 = Type::primitive_type_builder("item3", PhysicalType::INT32)
             .with_repetition(Repetition::REPEATED)
             .with_converted_type(ConvertedType::INT_32)
@@ -1619,17 +1847,17 @@ mod tests {
         let list = Type::group_type_builder("records")
             .with_repetition(Repetition::REPEATED)
             .with_converted_type(ConvertedType::LIST)
-            .with_fields(&mut vec![Arc::new(item1), Arc::new(item2), Arc::new(item3)])
+            .with_fields(vec![Arc::new(item1), Arc::new(item2), Arc::new(item3)])
             .build()?;
         let bag = Type::group_type_builder("bag")
             .with_repetition(Repetition::OPTIONAL)
-            .with_fields(&mut vec![Arc::new(list)])
+            .with_fields(vec![Arc::new(list)])
             .build()?;
         fields.push(Arc::new(bag));
 
         let schema = Type::group_type_builder("schema")
             .with_repetition(Repetition::REPEATED)
-            .with_fields(&mut fields)
+            .with_fields(fields)
             .build()?;
         let descr = SchemaDescriptor::new(Arc::new(schema));
 
@@ -1645,13 +1873,13 @@ mod tests {
         //     required int64 item1    2    1
         //     optional boolean item2  3    1
         //     repeated int32 item3    3    2
-        let ex_max_def_levels = vec![0, 1, 1, 2, 3, 3];
-        let ex_max_rep_levels = vec![0, 0, 1, 1, 1, 2];
+        let ex_max_def_levels = [0, 1, 1, 2, 3, 3];
+        let ex_max_rep_levels = [0, 0, 1, 1, 1, 2];
 
         for i in 0..nleaves {
             let col = descr.column(i);
-            assert_eq!(col.max_def_level(), ex_max_def_levels[i], "{}", i);
-            assert_eq!(col.max_rep_level(), ex_max_rep_levels[i], "{}", i);
+            assert_eq!(col.max_def_level(), ex_max_def_levels[i], "{i}");
+            assert_eq!(col.max_rep_level(), ex_max_rep_levels[i], "{i}");
         }
 
         assert_eq!(descr.column(0).path().string(), "a");
@@ -1778,13 +2006,9 @@ mod tests {
 
     // function to create a new group type for testing
     fn test_new_group_type(name: &str, repetition: Repetition, types: Vec<Type>) -> Type {
-        let mut fields = Vec::new();
-        for tpe in types {
-            fields.push(Arc::new(tpe))
-        }
         Type::group_type_builder(name)
             .with_repetition(repetition)
-            .with_fields(&mut fields)
+            .with_fields(types.into_iter().map(Arc::new).collect())
             .build()
             .unwrap()
     }
@@ -1795,6 +2019,7 @@ mod tests {
         let f1 = Type::group_type_builder("f").build().unwrap();
         let f2 = Type::group_type_builder("f").build().unwrap();
         assert!(f1.check_contains(&f2));
+        assert!(!f1.is_optional());
 
         // OK: fields match
         let f1 = test_new_group_type(
@@ -1979,7 +2204,7 @@ mod tests {
         assert!(thrift_schema.is_err());
         if let Err(e) = thrift_schema {
             assert_eq!(
-                format!("{}", e),
+                format!("{e}"),
                 "Parquet error: Root schema must be Group type"
             );
         }
@@ -1990,6 +2215,7 @@ mod tests {
         let message_type = "
     message conversions {
       REQUIRED INT64 id;
+      OPTIONAL FIXED_LEN_BYTE_ARRAY (2) f16 (FLOAT16);
       OPTIONAL group int_array_Array (LIST) {
         REPEATED group list {
           OPTIONAL group element (LIST) {
@@ -2074,7 +2300,7 @@ mod tests {
         let expected_schema = parse_message_type(message_type).unwrap();
         let mut thrift_schema = to_thrift(&expected_schema).unwrap();
         // Change all of None to Some(0)
-        for mut elem in &mut thrift_schema[..] {
+        for elem in &mut thrift_schema[..] {
             if elem.num_children.is_none() {
                 elem.num_children = Some(0);
             }
@@ -2095,6 +2321,18 @@ mod tests {
       OPTIONAL INT32 b (UINT_8);
     }
     ";
+
+        let expected_schema = parse_message_type(message_type).unwrap();
+        let mut thrift_schema = to_thrift(&expected_schema).unwrap();
+        thrift_schema[0].repetition_type = Some(Repetition::REQUIRED.into());
+
+        let result_schema = from_thrift(&thrift_schema).unwrap();
+        assert_eq!(result_schema, Arc::new(expected_schema));
+    }
+
+    #[test]
+    fn test_schema_from_thrift_group_has_no_child() {
+        let message_type = "message schema {}";
 
         let expected_schema = parse_message_type(message_type).unwrap();
         let mut thrift_schema = to_thrift(&expected_schema).unwrap();

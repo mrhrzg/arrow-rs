@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::Schema;
-use arrow::datatypes::{DataType, Field};
+// The unused_crate_dependencies lint does not work well for crates defining additional examples/bin targets
+#![allow(unused_crate_dependencies)]
+
 use arrow::error::{ArrowError, Result};
 use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::FileWriter;
 use arrow_integration_test::*;
-use arrow_integration_testing::read_json_file;
+use arrow_integration_testing::{canonicalize_schema, open_json_file};
 use clap::Parser;
 use std::fs::File;
 
@@ -42,7 +43,13 @@ struct Args {
     arrow: String,
     #[clap(short, long, help("Path to JSON file"))]
     json: String,
-    #[clap(value_enum, short, long, default_value_t = Mode::Validate, help="Mode of integration testing tool")]
+    #[clap(
+        value_enum,
+        short,
+        long,
+        default_value = "VALIDATE",
+        help = "Mode of integration testing tool"
+    )]
     mode: Mode,
     #[clap(short, long)]
     verbose: bool,
@@ -62,15 +69,15 @@ fn main() -> Result<()> {
 
 fn json_to_arrow(json_name: &str, arrow_name: &str, verbose: bool) -> Result<()> {
     if verbose {
-        eprintln!("Converting {} to {}", json_name, arrow_name);
+        eprintln!("Converting {json_name} to {arrow_name}");
     }
 
-    let json_file = read_json_file(json_name)?;
+    let json_file = open_json_file(json_name)?;
 
     let arrow_file = File::create(arrow_name)?;
     let mut writer = FileWriter::try_new(arrow_file, &json_file.schema)?;
 
-    for b in json_file.batches {
+    for b in json_file.read_batches()? {
         writer.write(&b)?;
     }
 
@@ -81,7 +88,7 @@ fn json_to_arrow(json_name: &str, arrow_name: &str, verbose: bool) -> Result<()>
 
 fn arrow_to_json(arrow_name: &str, json_name: &str, verbose: bool) -> Result<()> {
     if verbose {
-        eprintln!("Converting {} to {}", arrow_name, json_name);
+        eprintln!("Converting {arrow_name} to {json_name}");
     }
 
     let arrow_file = File::open(arrow_name)?;
@@ -112,54 +119,13 @@ fn arrow_to_json(arrow_name: &str, json_name: &str, verbose: bool) -> Result<()>
     Ok(())
 }
 
-fn canonicalize_schema(schema: &Schema) -> Schema {
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| match field.data_type() {
-            DataType::Map(child_field, sorted) => match child_field.data_type() {
-                DataType::Struct(fields) if fields.len() == 2 => {
-                    let first_field = fields.get(0).unwrap();
-                    let key_field = Field::new(
-                        "key",
-                        first_field.data_type().clone(),
-                        first_field.is_nullable(),
-                    );
-                    let second_field = fields.get(1).unwrap();
-                    let value_field = Field::new(
-                        "value",
-                        second_field.data_type().clone(),
-                        second_field.is_nullable(),
-                    );
-
-                    let struct_type = DataType::Struct(vec![key_field, value_field]);
-                    let child_field =
-                        Field::new("entries", struct_type, child_field.is_nullable());
-
-                    Field::new(
-                        field.name().as_str(),
-                        DataType::Map(Box::new(child_field), *sorted),
-                        field.is_nullable(),
-                    )
-                }
-                _ => panic!(
-                    "The child field of Map type should be Struct type with 2 fields."
-                ),
-            },
-            _ => field.clone(),
-        })
-        .collect::<Vec<_>>();
-
-    Schema::new(fields).with_metadata(schema.metadata().clone())
-}
-
 fn validate(arrow_name: &str, json_name: &str, verbose: bool) -> Result<()> {
     if verbose {
-        eprintln!("Validating {} and {}", arrow_name, json_name);
+        eprintln!("Validating {arrow_name} and {json_name}");
     }
 
     // open JSON file
-    let json_file = read_json_file(json_name)?;
+    let json_file = open_json_file(json_name)?;
 
     // open Arrow file
     let arrow_file = File::open(arrow_name)?;
@@ -174,7 +140,7 @@ fn validate(arrow_name: &str, json_name: &str, verbose: bool) -> Result<()> {
         )));
     }
 
-    let json_batches = &json_file.batches;
+    let json_batches = json_file.read_batches()?;
 
     // compare number of batches
     assert!(
@@ -198,8 +164,8 @@ fn validate(arrow_name: &str, json_name: &str, verbose: bool) -> Result<()> {
 
             for i in 0..num_columns {
                 assert_eq!(
-                    arrow_batch.column(i).data(),
-                    json_batch.column(i).data(),
+                    arrow_batch.column(i).as_ref(),
+                    json_batch.column(i).as_ref(),
                     "Arrow and JSON batch columns not the same"
                 );
             }

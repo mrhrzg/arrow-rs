@@ -18,12 +18,165 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
+use std::sync::Arc;
 
 use crate::error::ArrowError;
 use crate::field::Field;
+use crate::{DataType, FieldRef, Fields};
+
+/// A builder to facilitate building a [`Schema`] from iteratively from [`FieldRef`]
+#[derive(Debug, Default)]
+pub struct SchemaBuilder {
+    fields: Vec<FieldRef>,
+    metadata: HashMap<String, String>,
+}
+
+impl SchemaBuilder {
+    /// Creates a new empty [`SchemaBuilder`]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new empty [`SchemaBuilder`] with space for `capacity` fields
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            fields: Vec::with_capacity(capacity),
+            metadata: Default::default(),
+        }
+    }
+
+    /// Appends a [`FieldRef`] to this [`SchemaBuilder`] without checking for collision
+    pub fn push(&mut self, field: impl Into<FieldRef>) {
+        self.fields.push(field.into())
+    }
+
+    /// Removes and returns the [`FieldRef`] as index `idx`
+    ///
+    /// # Panics
+    ///
+    /// Panics if index out of bounds
+    pub fn remove(&mut self, idx: usize) -> FieldRef {
+        self.fields.remove(idx)
+    }
+
+    /// Returns an immutable reference to the [`FieldRef`] at index `idx`
+    ///
+    /// # Panics
+    ///
+    /// Panics if index out of bounds
+    pub fn field(&mut self, idx: usize) -> &FieldRef {
+        &mut self.fields[idx]
+    }
+
+    /// Returns a mutable reference to the [`FieldRef`] at index `idx`
+    ///
+    /// # Panics
+    ///
+    /// Panics if index out of bounds
+    pub fn field_mut(&mut self, idx: usize) -> &mut FieldRef {
+        &mut self.fields[idx]
+    }
+
+    /// Returns an immutable reference to the Map of custom metadata key-value pairs.
+    pub fn metadata(&mut self) -> &HashMap<String, String> {
+        &self.metadata
+    }
+
+    /// Returns a mutable reference to the Map of custom metadata key-value pairs.
+    pub fn metadata_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self.metadata
+    }
+
+    /// Reverse the fileds
+    pub fn reverse(&mut self) {
+        self.fields.reverse();
+    }
+
+    /// Appends a [`FieldRef`] to this [`SchemaBuilder`] checking for collision
+    ///
+    /// If an existing field exists with the same name, calls [`Field::try_merge`]
+    pub fn try_merge(&mut self, field: &FieldRef) -> Result<(), ArrowError> {
+        // This could potentially be sped up with a HashMap or similar
+        let existing = self.fields.iter_mut().find(|f| f.name() == field.name());
+        match existing {
+            Some(e) if Arc::ptr_eq(e, field) => {} // Nothing to do
+            Some(e) => match Arc::get_mut(e) {
+                Some(e) => e.try_merge(field.as_ref())?,
+                None => {
+                    let mut t = e.as_ref().clone();
+                    t.try_merge(field)?;
+                    *e = Arc::new(t)
+                }
+            },
+            None => self.fields.push(field.clone()),
+        }
+        Ok(())
+    }
+
+    /// Consume this [`SchemaBuilder`] yielding the final [`Schema`]
+    pub fn finish(self) -> Schema {
+        Schema {
+            fields: self.fields.into(),
+            metadata: self.metadata,
+        }
+    }
+}
+
+impl From<&Fields> for SchemaBuilder {
+    fn from(value: &Fields) -> Self {
+        Self {
+            fields: value.to_vec(),
+            metadata: Default::default(),
+        }
+    }
+}
+
+impl From<Fields> for SchemaBuilder {
+    fn from(value: Fields) -> Self {
+        Self {
+            fields: value.to_vec(),
+            metadata: Default::default(),
+        }
+    }
+}
+
+impl From<&Schema> for SchemaBuilder {
+    fn from(value: &Schema) -> Self {
+        Self::from(value.clone())
+    }
+}
+
+impl From<Schema> for SchemaBuilder {
+    fn from(value: Schema) -> Self {
+        Self {
+            fields: value.fields.to_vec(),
+            metadata: value.metadata,
+        }
+    }
+}
+
+impl Extend<FieldRef> for SchemaBuilder {
+    fn extend<T: IntoIterator<Item = FieldRef>>(&mut self, iter: T) {
+        let iter = iter.into_iter();
+        self.fields.reserve(iter.size_hint().0);
+        for f in iter {
+            self.push(f)
+        }
+    }
+}
+
+impl Extend<Field> for SchemaBuilder {
+    fn extend<T: IntoIterator<Item = Field>>(&mut self, iter: T) {
+        let iter = iter.into_iter();
+        self.fields.reserve(iter.size_hint().0);
+        for f in iter {
+            self.push(f)
+        }
+    }
+}
 
 /// A reference-counted reference to a [`Schema`].
-pub type SchemaRef = std::sync::Arc<Schema>;
+pub type SchemaRef = Arc<Schema>;
 
 /// Describes the meta-data of an ordered sequence of relative types.
 ///
@@ -32,12 +185,9 @@ pub type SchemaRef = std::sync::Arc<Schema>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Schema {
-    pub fields: Vec<Field>,
+    /// A sequence of fields that describe the schema.
+    pub fields: Fields,
     /// A map of key-value pairs containing additional meta data.
-    #[cfg_attr(
-        feature = "serde",
-        serde(skip_serializing_if = "HashMap::is_empty", default)
-    )]
     pub metadata: HashMap<String, String>,
 }
 
@@ -45,7 +195,7 @@ impl Schema {
     /// Creates an empty `Schema`
     pub fn empty() -> Self {
         Self {
-            fields: vec![],
+            fields: Default::default(),
             metadata: HashMap::new(),
         }
     }
@@ -61,7 +211,7 @@ impl Schema {
     ///
     /// let schema = Schema::new(vec![field_a, field_b]);
     /// ```
-    pub fn new(fields: Vec<Field>) -> Self {
+    pub fn new(fields: impl Into<Fields>) -> Self {
         Self::new_with_metadata(fields, HashMap::new())
     }
 
@@ -83,11 +233,11 @@ impl Schema {
     /// let schema = Schema::new_with_metadata(vec![field_a, field_b], metadata);
     /// ```
     #[inline]
-    pub const fn new_with_metadata(
-        fields: Vec<Field>,
-        metadata: HashMap<String, String>,
-    ) -> Self {
-        Self { fields, metadata }
+    pub fn new_with_metadata(fields: impl Into<Fields>, metadata: HashMap<String, String>) -> Self {
+        Self {
+            fields: fields.into(),
+            metadata,
+        }
     }
 
     /// Sets the metadata of this `Schema` to be `metadata` and returns self
@@ -142,54 +292,92 @@ impl Schema {
     ///     ]),
     /// );
     /// ```
-    pub fn try_merge(
-        schemas: impl IntoIterator<Item = Self>,
-    ) -> Result<Self, ArrowError> {
-        schemas
-            .into_iter()
-            .try_fold(Self::empty(), |mut merged, schema| {
-                let Schema { metadata, fields } = schema;
-                for (key, value) in metadata.into_iter() {
-                    // merge metadata
-                    if let Some(old_val) = merged.metadata.get(&key) {
-                        if old_val != &value {
-                            return Err(ArrowError::SchemaError(format!(
-                                "Fail to merge schema due to conflicting metadata. \
-                                         Key '{}' has different values '{}' and '{}'",
-                                key, old_val, value
-                            )));
-                        }
-                    }
-                    merged.metadata.insert(key, value);
-                }
-                // merge fields
-                for field in fields.into_iter() {
-                    let merged_field =
-                        merged.fields.iter_mut().find(|f| f.name() == field.name());
-                    match merged_field {
-                        Some(merged_field) => merged_field.try_merge(&field)?,
-                        // found a new field, add to field list
-                        None => merged.fields.push(field),
+    pub fn try_merge(schemas: impl IntoIterator<Item = Self>) -> Result<Self, ArrowError> {
+        let mut out_meta = HashMap::new();
+        let mut out_fields = SchemaBuilder::new();
+        for schema in schemas {
+            let Schema { metadata, fields } = schema;
+
+            // merge metadata
+            for (key, value) in metadata.into_iter() {
+                if let Some(old_val) = out_meta.get(&key) {
+                    if old_val != &value {
+                        return Err(ArrowError::SchemaError(format!(
+                            "Fail to merge schema due to conflicting metadata. \
+                                         Key '{key}' has different values '{old_val}' and '{value}'"
+                        )));
                     }
                 }
-                Ok(merged)
-            })
+                out_meta.insert(key, value);
+            }
+
+            // merge fields
+            fields.iter().try_for_each(|x| out_fields.try_merge(x))?
+        }
+
+        Ok(out_fields.finish().with_metadata(out_meta))
     }
 
     /// Returns an immutable reference of the vector of `Field` instances.
     #[inline]
-    pub const fn fields(&self) -> &Vec<Field> {
+    pub const fn fields(&self) -> &Fields {
         &self.fields
     }
 
     /// Returns a vector with references to all fields (including nested fields)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow_schema::{DataType, Field, Fields, Schema};
+    ///
+    /// let f1 = Arc::new(Field::new("a", DataType::Boolean, false));
+    ///
+    /// let f2_inner = Arc::new(Field::new("b_inner", DataType::Int8, false));
+    /// let f2 = Arc::new(Field::new("b", DataType::List(f2_inner.clone()), false));
+    ///
+    /// let f3_inner1 = Arc::new(Field::new("c_inner1", DataType::Int8, false));
+    /// let f3_inner2 = Arc::new(Field::new("c_inner2", DataType::Int8, false));
+    /// let f3 = Arc::new(Field::new(
+    ///     "c",
+    ///     DataType::Struct(vec![f3_inner1.clone(), f3_inner2.clone()].into()),
+    ///     false
+    /// ));
+    ///
+    /// let mut schema = Schema::new(vec![
+    ///   f1.clone(), f2.clone(), f3.clone()
+    /// ]);
+    /// assert_eq!(
+    ///     schema.flattened_fields(),
+    ///     vec![
+    ///         f1.as_ref(),
+    ///         f2.as_ref(),
+    ///         f2_inner.as_ref(),
+    ///         f3.as_ref(),
+    ///         f3_inner1.as_ref(),
+    ///         f3_inner2.as_ref()
+    ///    ]
+    /// );
+    /// ```
+    #[inline]
+    pub fn flattened_fields(&self) -> Vec<&Field> {
+        self.fields.iter().flat_map(|f| f.fields()).collect()
+    }
+
+    /// Returns a vector with references to all fields (including nested fields)
+    #[deprecated(since = "52.2.0", note = "Use `flattened_fields` instead")]
     #[inline]
     pub fn all_fields(&self) -> Vec<&Field> {
-        self.fields.iter().flat_map(|f| f.fields()).collect()
+        self.flattened_fields()
     }
 
     /// Returns an immutable reference of a specific [`Field`] instance selected using an
     /// offset within the internal `fields` vector.
+    ///
+    /// # Panics
+    ///
+    /// Panics if index out of bounds
     pub fn field(&self, i: usize) -> &Field {
         &self.fields[i]
     }
@@ -201,7 +389,12 @@ impl Schema {
 
     /// Returns a vector of immutable references to all [`Field`] instances selected by
     /// the dictionary ID they use.
+    #[deprecated(
+        since = "54.0.0",
+        note = "The ability to preserve dictionary IDs will be removed. With it, all functions related to it."
+    )]
     pub fn fields_with_dict_id(&self, dict_id: i64) -> Vec<&Field> {
+        #[allow(deprecated)]
         self.fields
             .iter()
             .flat_map(|f| f.fields_with_dict_id(dict_id))
@@ -210,16 +403,13 @@ impl Schema {
 
     /// Find the index of the column with the given name.
     pub fn index_of(&self, name: &str) -> Result<usize, ArrowError> {
-        (0..self.fields.len())
-            .find(|idx| self.fields[*idx].name() == name)
-            .ok_or_else(|| {
-                let valid_fields: Vec<String> =
-                    self.fields.iter().map(|f| f.name().clone()).collect();
-                ArrowError::SchemaError(format!(
-                    "Unable to get field named \"{}\". Valid fields: {:?}",
-                    name, valid_fields
-                ))
-            })
+        let (idx, _) = self.fields().find(name).ok_or_else(|| {
+            let valid_fields: Vec<_> = self.fields.iter().map(|f| f.name()).collect();
+            ArrowError::SchemaError(format!(
+                "Unable to get field named \"{name}\". Valid fields: {valid_fields:?}"
+            ))
+        })?;
+        Ok(idx)
     }
 
     /// Returns an immutable reference to the Map of custom metadata key-value pairs.
@@ -228,31 +418,109 @@ impl Schema {
         &self.metadata
     }
 
+    /// Normalize a [`Schema`] into a flat table.
+    ///
+    /// Nested [`Field`]s will generate names separated by `separator`, up to a depth of `max_level`
+    /// (unlimited if `None`).
+    ///
+    /// e.g. given a [`Schema`]:
+    ///
+    /// ```text
+    ///     "foo": StructArray<"bar": Utf8>
+    /// ```
+    ///
+    /// A separator of `"."` would generate a batch with the schema:
+    ///
+    /// ```text
+    ///     "foo.bar": Utf8
+    /// ```
+    ///
+    /// Note that giving a depth of `Some(0)` to `max_level` is the same as passing in `None`;
+    /// it will be treated as unlimited.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_schema::{DataType, Field, Fields, Schema};
+    /// let schema = Schema::new(vec![
+    ///     Field::new(
+    ///         "a",
+    ///         DataType::Struct(Fields::from(vec![
+    ///             Arc::new(Field::new("animals", DataType::Utf8, true)),
+    ///             Arc::new(Field::new("n_legs", DataType::Int64, true)),
+    ///         ])),
+    ///         false,
+    ///     ),
+    /// ])
+    /// .normalize(".", None)
+    /// .expect("valid normalization");
+    /// let expected = Schema::new(vec![
+    ///     Field::new("a.animals", DataType::Utf8, true),
+    ///     Field::new("a.n_legs", DataType::Int64, true),
+    /// ]);
+    /// assert_eq!(schema, expected);
+    /// ```
+    pub fn normalize(&self, separator: &str, max_level: Option<usize>) -> Result<Self, ArrowError> {
+        let max_level = match max_level.unwrap_or(usize::MAX) {
+            0 => usize::MAX,
+            val => val,
+        };
+        let mut stack: Vec<(usize, Vec<&str>, &FieldRef)> = self
+            .fields()
+            .iter()
+            .rev()
+            .map(|f| {
+                let name_vec: Vec<&str> = vec![f.name()];
+                (0, name_vec, f)
+            })
+            .collect();
+        let mut fields: Vec<FieldRef> = Vec::new();
+
+        while let Some((depth, name, field_ref)) = stack.pop() {
+            match field_ref.data_type() {
+                DataType::Struct(ff) if depth < max_level => {
+                    // Need to zip these in reverse to maintain original order
+                    for fff in ff.into_iter().rev() {
+                        let mut name = name.clone();
+                        name.push(separator);
+                        name.push(fff.name());
+                        stack.push((depth + 1, name, fff))
+                    }
+                }
+                _ => {
+                    let updated_field = Field::new(
+                        name.concat(),
+                        field_ref.data_type().clone(),
+                        field_ref.is_nullable(),
+                    );
+                    fields.push(Arc::new(updated_field));
+                }
+            }
+        }
+        Ok(Schema::new(fields))
+    }
+
     /// Look up a column by name and return a immutable reference to the column along with
     /// its index.
     pub fn column_with_name(&self, name: &str) -> Option<(usize, &Field)> {
-        self.fields
-            .iter()
-            .enumerate()
-            .find(|&(_, c)| c.name() == name)
+        let (idx, field) = self.fields.find(name)?;
+        Some((idx, field.as_ref()))
     }
 
-    /// Check to see if `self` is a superset of `other` schema. Here are the comparison rules:
+    /// Check to see if `self` is a superset of `other` schema.
     ///
-    /// * `self` and `other` should contain the same number of fields
-    /// * for every field `f` in `other`, the field in `self` with corresponding index should be a
-    /// superset of `f`.
-    /// * self.metadata is a superset of other.metadata
+    /// In particular returns true if `self.metadata` is a superset of `other.metadata`
+    /// and [`Fields::contains`] for `self.fields` and `other.fields`
     ///
-    /// In other words, any record conforms to `other` should also conform to `self`.
+    /// In other words, any record that conforms to `other` should also conform to `self`.
     pub fn contains(&self, other: &Schema) -> bool {
-        self.fields.len() == other.fields.len()
-        && self.fields.iter().zip(other.fields.iter()).all(|(f1, f2)| f1.contains(f2))
         // make sure self.metadata is a superset of other.metadata
-        && other.metadata.iter().all(|(k, v1)| match self.metadata.get(k) {
-            Some(v2) => v1 == v2,
-            _ => false,
-        })
+        self.fields.contains(&other.fields)
+            && other
+                .metadata
+                .iter()
+                .all(|(k, v1)| self.metadata.get(k).map(|v2| v1 == v2).unwrap_or_default())
     }
 }
 
@@ -270,7 +538,7 @@ impl fmt::Display for Schema {
 }
 
 // need to implement `Hash` manually because `HashMap` implement Eq but no `Hash`
-#[allow(clippy::derive_hash_xor_eq)]
+#[allow(clippy::derived_hash_with_manual_eq)]
 impl Hash for Schema {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.fields.hash(state);
@@ -287,10 +555,10 @@ impl Hash for Schema {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::datatype::DataType;
     use crate::{TimeUnit, UnionMode};
-    use std::collections::BTreeMap;
+
+    use super::*;
 
     #[test]
     #[cfg(feature = "serde")]
@@ -308,8 +576,8 @@ mod tests {
         assert_eq!(schema, de_schema);
 
         // ser/de with non-empty metadata
-        let schema = schema
-            .with_metadata([("key".to_owned(), "val".to_owned())].into_iter().collect());
+        let schema =
+            schema.with_metadata([("key".to_owned(), "val".to_owned())].into_iter().collect());
         let json = serde_json::to_string(&schema).unwrap();
         let de_schema = serde_json::from_str(&json).unwrap();
 
@@ -419,12 +687,12 @@ mod tests {
         assert_ne!(schema2, schema4);
         assert_ne!(schema3, schema4);
 
-        let f = Field::new("c1", DataType::Utf8, false).with_metadata(Some(
+        let f = Field::new("c1", DataType::Utf8, false).with_metadata(
             [("foo".to_string(), "bar".to_string())]
                 .iter()
                 .cloned()
                 .collect(),
-        ));
+        );
         let schema5 = Schema::new(vec![
             f,
             Field::new("c2", DataType::Float64, true),
@@ -437,13 +705,13 @@ mod tests {
     fn create_schema_string() {
         let schema = person_schema();
         assert_eq!(schema.to_string(),
-                   "Field { name: \"first_name\", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: Some({\"k\": \"v\"}) }, \
-        Field { name: \"last_name\", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: None }, \
+                   "Field { name: \"first_name\", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {\"k\": \"v\"} }, \
+        Field { name: \"last_name\", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }, \
         Field { name: \"address\", data_type: Struct([\
-            Field { name: \"street\", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: None }, \
-            Field { name: \"zip\", data_type: UInt16, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: None }\
-        ]), nullable: false, dict_id: 0, dict_is_ordered: false, metadata: None }, \
-        Field { name: \"interests\", data_type: Dictionary(Int32, Utf8), nullable: true, dict_id: 123, dict_is_ordered: true, metadata: None }")
+            Field { name: \"street\", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }, \
+            Field { name: \"zip\", data_type: UInt16, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }\
+        ]), nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }, \
+        Field { name: \"interests\", data_type: Dictionary(Int32, Utf8), nullable: true, dict_id: 123, dict_is_ordered: true, metadata: {} }")
     }
 
     #[test]
@@ -458,12 +726,14 @@ mod tests {
         assert_eq!(first_name.name(), "first_name");
         assert_eq!(first_name.data_type(), &DataType::Utf8);
         assert!(!first_name.is_nullable());
-        assert_eq!(first_name.dict_id(), None);
+        #[allow(deprecated)]
+        let dict_id = first_name.dict_id();
+        assert_eq!(dict_id, None);
         assert_eq!(first_name.dict_is_ordered(), None);
 
         let metadata = first_name.metadata();
-        assert!(metadata.is_some());
-        let md = metadata.as_ref().unwrap();
+        assert!(!metadata.is_empty());
+        let md = &metadata;
         assert_eq!(md.len(), 1);
         let key = md.get("k");
         assert!(key.is_some());
@@ -475,7 +745,9 @@ mod tests {
             interests.data_type(),
             &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
         );
-        assert_eq!(interests.dict_id(), Some(123));
+        #[allow(deprecated)]
+        let dict_id = interests.dict_id();
+        assert_eq!(dict_id, Some(123));
         assert_eq!(interests.dict_is_ordered(), Some(true));
     }
 
@@ -488,6 +760,410 @@ mod tests {
         assert_eq!(schema.index_of("first_name").unwrap(), 0);
         assert_eq!(schema.index_of("last_name").unwrap(), 1);
         schema.index_of("nickname").unwrap();
+    }
+
+    #[test]
+    fn normalize_simple() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "a",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("animals", DataType::Utf8, true)),
+                    Arc::new(Field::new("n_legs", DataType::Int64, true)),
+                    Arc::new(Field::new("year", DataType::Int64, true)),
+                ])),
+                false,
+            ),
+            Field::new("month", DataType::Int64, true),
+        ])
+        .normalize(".", Some(0))
+        .expect("valid normalization");
+
+        let expected = Schema::new(vec![
+            Field::new("a.animals", DataType::Utf8, true),
+            Field::new("a.n_legs", DataType::Int64, true),
+            Field::new("a.year", DataType::Int64, true),
+            Field::new("month", DataType::Int64, true),
+        ]);
+
+        assert_eq!(schema, expected);
+
+        // Check that 0, None have the same result
+        let schema = Schema::new(vec![
+            Field::new(
+                "a",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("animals", DataType::Utf8, true)),
+                    Arc::new(Field::new("n_legs", DataType::Int64, true)),
+                    Arc::new(Field::new("year", DataType::Int64, true)),
+                ])),
+                false,
+            ),
+            Field::new("month", DataType::Int64, true),
+        ])
+        .normalize(".", None)
+        .expect("valid normalization");
+
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn normalize_nested() {
+        let a = Arc::new(Field::new("a", DataType::Utf8, true));
+        let b = Arc::new(Field::new("b", DataType::Int64, false));
+        let c = Arc::new(Field::new("c", DataType::Int64, true));
+
+        let d = Arc::new(Field::new("d", DataType::Utf8, true));
+        let e = Arc::new(Field::new("e", DataType::Int64, false));
+        let f = Arc::new(Field::new("f", DataType::Int64, true));
+
+        let one = Arc::new(Field::new(
+            "1",
+            DataType::Struct(Fields::from(vec![a.clone(), b.clone(), c.clone()])),
+            false,
+        ));
+        let two = Arc::new(Field::new(
+            "2",
+            DataType::Struct(Fields::from(vec![d.clone(), e.clone(), f.clone()])),
+            true,
+        ));
+
+        let exclamation = Arc::new(Field::new(
+            "!",
+            DataType::Struct(Fields::from(vec![one, two])),
+            false,
+        ));
+
+        let normalize_all = Schema::new(vec![exclamation.clone()])
+            .normalize(".", Some(0))
+            .expect("valid normalization");
+
+        let expected = Schema::new(vec![
+            Field::new("!.1.a", DataType::Utf8, true),
+            Field::new("!.1.b", DataType::Int64, false),
+            Field::new("!.1.c", DataType::Int64, true),
+            Field::new("!.2.d", DataType::Utf8, true),
+            Field::new("!.2.e", DataType::Int64, false),
+            Field::new("!.2.f", DataType::Int64, true),
+        ]);
+
+        assert_eq!(normalize_all, expected);
+
+        let normalize_depth_one = Schema::new(vec![exclamation])
+            .normalize(".", Some(1))
+            .expect("valid normalization");
+
+        let expected = Schema::new(vec![
+            Field::new("!.1", DataType::Struct(Fields::from(vec![a, b, c])), false),
+            Field::new("!.2", DataType::Struct(Fields::from(vec![d, e, f])), true),
+        ]);
+
+        assert_eq!(normalize_depth_one, expected);
+    }
+
+    #[test]
+    fn normalize_list() {
+        // Only the Struct type field should be unwrapped
+        let a = Arc::new(Field::new("a", DataType::Utf8, true));
+        let b = Arc::new(Field::new("b", DataType::Int64, false));
+        let c = Arc::new(Field::new("c", DataType::Int64, true));
+        let d = Arc::new(Field::new("d", DataType::Utf8, true));
+        let e = Arc::new(Field::new("e", DataType::Int64, false));
+        let f = Arc::new(Field::new("f", DataType::Int64, true));
+
+        let one = Arc::new(Field::new(
+            "1",
+            DataType::Struct(Fields::from(vec![a.clone(), b.clone(), c.clone()])),
+            true,
+        ));
+
+        let two = Arc::new(Field::new(
+            "2",
+            DataType::List(Arc::new(Field::new_list_field(
+                DataType::Struct(Fields::from(vec![d.clone(), e.clone(), f.clone()])),
+                true,
+            ))),
+            false,
+        ));
+
+        let exclamation = Arc::new(Field::new(
+            "!",
+            DataType::Struct(Fields::from(vec![one.clone(), two.clone()])),
+            false,
+        ));
+
+        let normalize_all = Schema::new(vec![exclamation.clone()])
+            .normalize(".", None)
+            .expect("valid normalization");
+
+        // List shouldn't be affected
+        let expected = Schema::new(vec![
+            Field::new("!.1.a", DataType::Utf8, true),
+            Field::new("!.1.b", DataType::Int64, false),
+            Field::new("!.1.c", DataType::Int64, true),
+            Field::new(
+                "!.2",
+                DataType::List(Arc::new(Field::new_list_field(
+                    DataType::Struct(Fields::from(vec![d.clone(), e.clone(), f.clone()])),
+                    true,
+                ))),
+                false,
+            ),
+        ]);
+
+        assert_eq!(normalize_all, expected);
+        assert_eq!(normalize_all.fields().len(), 4);
+
+        // FixedSizeList
+        let two = Arc::new(Field::new(
+            "2",
+            DataType::FixedSizeList(
+                Arc::new(Field::new_fixed_size_list(
+                    "3",
+                    Arc::new(Field::new_list_field(
+                        DataType::Struct(Fields::from(vec![d.clone(), e.clone(), f.clone()])),
+                        true,
+                    )),
+                    1,
+                    true,
+                )),
+                1,
+            ),
+            false,
+        ));
+
+        let exclamation = Arc::new(Field::new(
+            "!",
+            DataType::Struct(Fields::from(vec![one.clone(), two])),
+            false,
+        ));
+
+        let normalize_all = Schema::new(vec![exclamation.clone()])
+            .normalize(".", None)
+            .expect("valid normalization");
+
+        // FixedSizeList shouldn't be affected
+        let expected = Schema::new(vec![
+            Field::new("!.1.a", DataType::Utf8, true),
+            Field::new("!.1.b", DataType::Int64, false),
+            Field::new("!.1.c", DataType::Int64, true),
+            Field::new(
+                "!.2",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new_fixed_size_list(
+                        "3",
+                        Arc::new(Field::new_list_field(
+                            DataType::Struct(Fields::from(vec![d.clone(), e.clone(), f.clone()])),
+                            true,
+                        )),
+                        1,
+                        true,
+                    )),
+                    1,
+                ),
+                false,
+            ),
+        ]);
+
+        assert_eq!(normalize_all, expected);
+        assert_eq!(normalize_all.fields().len(), 4);
+
+        // LargeList
+        let two = Arc::new(Field::new(
+            "2",
+            DataType::FixedSizeList(
+                Arc::new(Field::new_large_list(
+                    "3",
+                    Arc::new(Field::new_list_field(
+                        DataType::Struct(Fields::from(vec![d.clone(), e.clone(), f.clone()])),
+                        true,
+                    )),
+                    true,
+                )),
+                1,
+            ),
+            false,
+        ));
+
+        let exclamation = Arc::new(Field::new(
+            "!",
+            DataType::Struct(Fields::from(vec![one.clone(), two])),
+            false,
+        ));
+
+        let normalize_all = Schema::new(vec![exclamation.clone()])
+            .normalize(".", None)
+            .expect("valid normalization");
+
+        // LargeList shouldn't be affected
+        let expected = Schema::new(vec![
+            Field::new("!.1.a", DataType::Utf8, true),
+            Field::new("!.1.b", DataType::Int64, false),
+            Field::new("!.1.c", DataType::Int64, true),
+            Field::new(
+                "!.2",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new_large_list(
+                        "3",
+                        Arc::new(Field::new_list_field(
+                            DataType::Struct(Fields::from(vec![d.clone(), e.clone(), f.clone()])),
+                            true,
+                        )),
+                        true,
+                    )),
+                    1,
+                ),
+                false,
+            ),
+        ]);
+
+        assert_eq!(normalize_all, expected);
+        assert_eq!(normalize_all.fields().len(), 4);
+    }
+
+    #[test]
+    fn normalize_deep_nested() {
+        // No unwrapping expected
+        let a = Arc::new(Field::new("a", DataType::Utf8, true));
+        let b = Arc::new(Field::new("b", DataType::Int64, false));
+        let c = Arc::new(Field::new("c", DataType::Int64, true));
+        let d = Arc::new(Field::new("d", DataType::Utf8, true));
+        let e = Arc::new(Field::new("e", DataType::Int64, false));
+        let f = Arc::new(Field::new("f", DataType::Int64, true));
+
+        let one = Arc::new(Field::new(
+            "1",
+            DataType::Struct(Fields::from(vec![a.clone(), b.clone(), c.clone()])),
+            true,
+        ));
+
+        let two = Arc::new(Field::new(
+            "2",
+            DataType::List(Arc::new(Field::new_list_field(
+                DataType::Struct(Fields::from(vec![d.clone(), e.clone(), f.clone()])),
+                true,
+            ))),
+            false,
+        ));
+
+        let l10 = Arc::new(Field::new(
+            "l10",
+            DataType::List(Arc::new(Field::new_list_field(
+                DataType::Struct(Fields::from(vec![one, two])),
+                true,
+            ))),
+            false,
+        ));
+
+        let l9 = Arc::new(Field::new(
+            "l9",
+            DataType::List(Arc::new(Field::new_list_field(
+                DataType::Struct(Fields::from(vec![l10])),
+                true,
+            ))),
+            false,
+        ));
+
+        let l8 = Arc::new(Field::new(
+            "l8",
+            DataType::List(Arc::new(Field::new_list_field(
+                DataType::Struct(Fields::from(vec![l9])),
+                true,
+            ))),
+            false,
+        ));
+        let l7 = Arc::new(Field::new(
+            "l7",
+            DataType::List(Arc::new(Field::new_list_field(
+                DataType::Struct(Fields::from(vec![l8])),
+                true,
+            ))),
+            false,
+        ));
+        let l6 = Arc::new(Field::new(
+            "l6",
+            DataType::List(Arc::new(Field::new_list_field(
+                DataType::Struct(Fields::from(vec![l7])),
+                true,
+            ))),
+            false,
+        ));
+        let l5 = Arc::new(Field::new(
+            "l5",
+            DataType::List(Arc::new(Field::new_list_field(
+                DataType::Struct(Fields::from(vec![l6])),
+                true,
+            ))),
+            false,
+        ));
+        let l4 = Arc::new(Field::new(
+            "l4",
+            DataType::List(Arc::new(Field::new_list_field(
+                DataType::Struct(Fields::from(vec![l5])),
+                true,
+            ))),
+            false,
+        ));
+        let l3 = Arc::new(Field::new(
+            "l3",
+            DataType::List(Arc::new(Field::new_list_field(
+                DataType::Struct(Fields::from(vec![l4])),
+                true,
+            ))),
+            false,
+        ));
+        let l2 = Arc::new(Field::new(
+            "l2",
+            DataType::List(Arc::new(Field::new_list_field(
+                DataType::Struct(Fields::from(vec![l3])),
+                true,
+            ))),
+            false,
+        ));
+        let l1 = Arc::new(Field::new(
+            "l1",
+            DataType::List(Arc::new(Field::new_list_field(
+                DataType::Struct(Fields::from(vec![l2])),
+                true,
+            ))),
+            false,
+        ));
+
+        let normalize_all = Schema::new(vec![l1])
+            .normalize(".", None)
+            .expect("valid normalization");
+
+        assert_eq!(normalize_all.fields().len(), 1);
+    }
+
+    #[test]
+    fn normalize_dictionary() {
+        let a = Arc::new(Field::new("a", DataType::Utf8, true));
+        let b = Arc::new(Field::new("b", DataType::Int64, false));
+
+        let one = Arc::new(Field::new(
+            "1",
+            DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Struct(Fields::from(vec![a.clone(), b.clone()]))),
+            ),
+            false,
+        ));
+
+        let normalize_all = Schema::new(vec![one.clone()])
+            .normalize(".", None)
+            .expect("valid normalization");
+
+        let expected = Schema::new(vec![Field::new(
+            "1",
+            DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Struct(Fields::from(vec![a.clone(), b.clone()]))),
+            ),
+            false,
+        )]);
+
+        assert_eq!(normalize_all, expected);
     }
 
     #[test]
@@ -511,6 +1187,7 @@ mod tests {
     fn schema_field_with_dict_id() {
         let schema = person_schema();
 
+        #[allow(deprecated)]
         let fields_dict_123: Vec<_> = schema
             .fields_with_dict_id(123)
             .iter()
@@ -518,26 +1195,29 @@ mod tests {
             .collect();
         assert_eq!(fields_dict_123, vec!["interests"]);
 
-        assert!(schema.fields_with_dict_id(456).is_empty());
+        #[allow(deprecated)]
+        let is_empty = schema.fields_with_dict_id(456).is_empty();
+        assert!(is_empty);
     }
 
     fn person_schema() -> Schema {
         let kv_array = [("k".to_string(), "v".to_string())];
-        let field_metadata: BTreeMap<String, String> = kv_array.iter().cloned().collect();
-        let first_name = Field::new("first_name", DataType::Utf8, false)
-            .with_metadata(Some(field_metadata));
+        let field_metadata: HashMap<String, String> = kv_array.iter().cloned().collect();
+        let first_name =
+            Field::new("first_name", DataType::Utf8, false).with_metadata(field_metadata);
 
         Schema::new(vec![
             first_name,
             Field::new("last_name", DataType::Utf8, false),
             Field::new(
                 "address",
-                DataType::Struct(vec![
+                DataType::Struct(Fields::from(vec![
                     Field::new("street", DataType::Utf8, false),
                     Field::new("zip", DataType::UInt16, false),
-                ]),
+                ])),
                 false,
             ),
+            #[allow(deprecated)]
             Field::new_dict(
                 "interests",
                 DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
@@ -551,62 +1231,50 @@ mod tests {
     #[test]
     fn test_try_merge_field_with_metadata() {
         // 1. Different values for the same key should cause error.
-        let metadata1: BTreeMap<String, String> =
-            [("foo".to_string(), "bar".to_string())]
-                .iter()
-                .cloned()
-                .collect();
-        let f1 = Field::new("first_name", DataType::Utf8, false)
-            .with_metadata(Some(metadata1));
+        let metadata1: HashMap<String, String> = [("foo".to_string(), "bar".to_string())]
+            .iter()
+            .cloned()
+            .collect();
+        let f1 = Field::new("first_name", DataType::Utf8, false).with_metadata(metadata1);
 
-        let metadata2: BTreeMap<String, String> =
-            [("foo".to_string(), "baz".to_string())]
-                .iter()
-                .cloned()
-                .collect();
-        let f2 = Field::new("first_name", DataType::Utf8, false)
-            .with_metadata(Some(metadata2));
+        let metadata2: HashMap<String, String> = [("foo".to_string(), "baz".to_string())]
+            .iter()
+            .cloned()
+            .collect();
+        let f2 = Field::new("first_name", DataType::Utf8, false).with_metadata(metadata2);
 
-        assert!(
-            Schema::try_merge(vec![Schema::new(vec![f1]), Schema::new(vec![f2])])
-                .is_err()
-        );
+        assert!(Schema::try_merge(vec![Schema::new(vec![f1]), Schema::new(vec![f2])]).is_err());
 
         // 2. None + Some
         let mut f1 = Field::new("first_name", DataType::Utf8, false);
-        let metadata2: BTreeMap<String, String> =
-            [("missing".to_string(), "value".to_string())]
-                .iter()
-                .cloned()
-                .collect();
-        let f2 = Field::new("first_name", DataType::Utf8, false)
-            .with_metadata(Some(metadata2));
+        let metadata2: HashMap<String, String> = [("missing".to_string(), "value".to_string())]
+            .iter()
+            .cloned()
+            .collect();
+        let f2 = Field::new("first_name", DataType::Utf8, false).with_metadata(metadata2);
 
         assert!(f1.try_merge(&f2).is_ok());
-        assert!(f1.metadata().is_some());
-        assert_eq!(
-            f1.metadata().as_ref().unwrap(),
-            f2.metadata().as_ref().unwrap()
-        );
+        assert!(!f1.metadata().is_empty());
+        assert_eq!(f1.metadata(), f2.metadata());
 
         // 3. Some + Some
-        let mut f1 = Field::new("first_name", DataType::Utf8, false).with_metadata(Some(
+        let mut f1 = Field::new("first_name", DataType::Utf8, false).with_metadata(
             [("foo".to_string(), "bar".to_string())]
                 .iter()
                 .cloned()
                 .collect(),
-        ));
-        let f2 = Field::new("first_name", DataType::Utf8, false).with_metadata(Some(
+        );
+        let f2 = Field::new("first_name", DataType::Utf8, false).with_metadata(
             [("foo2".to_string(), "bar2".to_string())]
                 .iter()
                 .cloned()
                 .collect(),
-        ));
+        );
 
         assert!(f1.try_merge(&f2).is_ok());
-        assert!(f1.metadata().is_some());
+        assert!(!f1.metadata().is_empty());
         assert_eq!(
-            f1.metadata().cloned().unwrap(),
+            f1.metadata().clone(),
             [
                 ("foo".to_string(), "bar".to_string()),
                 ("foo2".to_string(), "bar2".to_string())
@@ -617,17 +1285,17 @@ mod tests {
         );
 
         // 4. Some + None.
-        let mut f1 = Field::new("first_name", DataType::Utf8, false).with_metadata(Some(
+        let mut f1 = Field::new("first_name", DataType::Utf8, false).with_metadata(
             [("foo".to_string(), "bar".to_string())]
                 .iter()
                 .cloned()
                 .collect(),
-        ));
+        );
         let f2 = Field::new("first_name", DataType::Utf8, false);
         assert!(f1.try_merge(&f2).is_ok());
-        assert!(f1.metadata().is_some());
+        assert!(!f1.metadata().is_empty());
         assert_eq!(
-            f1.metadata().cloned().unwrap(),
+            f1.metadata().clone(),
             [("foo".to_string(), "bar".to_string())]
                 .iter()
                 .cloned()
@@ -638,7 +1306,7 @@ mod tests {
         let mut f1 = Field::new("first_name", DataType::Utf8, false);
         let f2 = Field::new("first_name", DataType::Utf8, false);
         assert!(f1.try_merge(&f2).is_ok());
-        assert!(f1.metadata().is_none());
+        assert!(f1.metadata().is_empty());
     }
 
     #[test]
@@ -649,7 +1317,7 @@ mod tests {
                 Field::new("last_name", DataType::Utf8, false),
                 Field::new(
                     "address",
-                    DataType::Struct(vec![Field::new("zip", DataType::UInt16, false)]),
+                    DataType::Struct(vec![Field::new("zip", DataType::UInt16, false)].into()),
                     false,
                 ),
             ]),
@@ -659,12 +1327,12 @@ mod tests {
                     Field::new("last_name", DataType::Utf8, true),
                     Field::new(
                         "address",
-                        DataType::Struct(vec![
+                        DataType::Struct(Fields::from(vec![
                             // add new nested field
                             Field::new("street", DataType::Utf8, false),
                             // nullable merge on nested field
                             Field::new("zip", DataType::UInt16, true),
-                        ]),
+                        ])),
                         false,
                     ),
                     // new field
@@ -686,10 +1354,10 @@ mod tests {
                     Field::new("last_name", DataType::Utf8, true),
                     Field::new(
                         "address",
-                        DataType::Struct(vec![
+                        DataType::Struct(Fields::from(vec![
                             Field::new("zip", DataType::UInt16, true),
                             Field::new("street", DataType::Utf8, false),
-                        ]),
+                        ])),
                         false,
                     ),
                     Field::new("number", DataType::Utf8, true),
@@ -704,44 +1372,35 @@ mod tests {
         // support merge union fields
         assert_eq!(
             Schema::try_merge(vec![
-                Schema::new(vec![Field::new(
+                Schema::new(vec![Field::new_union(
                     "c1",
-                    DataType::Union(
-                        vec![
-                            Field::new("c11", DataType::Utf8, true),
-                            Field::new("c12", DataType::Utf8, true),
-                        ],
-                        vec![0, 1],
-                        UnionMode::Dense
-                    ),
-                    false
-                ),]),
-                Schema::new(vec![Field::new(
-                    "c1",
-                    DataType::Union(
-                        vec![
-                            Field::new("c12", DataType::Utf8, true),
-                            Field::new("c13", DataType::Time64(TimeUnit::Second), true),
-                        ],
-                        vec![1, 2],
-                        UnionMode::Dense
-                    ),
-                    false
-                ),])
-            ])
-            .unwrap(),
-            Schema::new(vec![Field::new(
-                "c1",
-                DataType::Union(
+                    vec![0, 1],
                     vec![
                         Field::new("c11", DataType::Utf8, true),
                         Field::new("c12", DataType::Utf8, true),
+                    ],
+                    UnionMode::Dense
+                ),]),
+                Schema::new(vec![Field::new_union(
+                    "c1",
+                    vec![1, 2],
+                    vec![
+                        Field::new("c12", DataType::Utf8, true),
                         Field::new("c13", DataType::Time64(TimeUnit::Second), true),
                     ],
-                    vec![0, 1, 2],
                     UnionMode::Dense
-                ),
-                false
+                ),])
+            ])
+            .unwrap(),
+            Schema::new(vec![Field::new_union(
+                "c1",
+                vec![0, 1, 2],
+                vec![
+                    Field::new("c11", DataType::Utf8, true),
+                    Field::new("c12", DataType::Utf8, true),
+                    Field::new("c13", DataType::Time64(TimeUnit::Second), true),
+                ],
+                UnionMode::Dense
             ),]),
         );
 
@@ -777,9 +1436,51 @@ mod tests {
         let expected = "Fail to merge schema due to conflicting metadata. Key 'foo' has different values 'bar' and 'baz'";
         assert!(
             res.to_string().contains(expected),
-            "Could not find expected string '{}' in '{}'",
-            expected,
-            res
+            "Could not find expected string '{expected}' in '{res}'"
         );
+    }
+
+    #[test]
+    fn test_schema_builder_change_field() {
+        let mut builder = SchemaBuilder::new();
+        builder.push(Field::new("a", DataType::Int32, false));
+        builder.push(Field::new("b", DataType::Utf8, false));
+        *builder.field_mut(1) = Arc::new(Field::new("c", DataType::Int32, false));
+        assert_eq!(
+            builder.fields,
+            vec![
+                Arc::new(Field::new("a", DataType::Int32, false)),
+                Arc::new(Field::new("c", DataType::Int32, false))
+            ]
+        );
+    }
+
+    #[test]
+    fn test_schema_builder_reverse() {
+        let mut builder = SchemaBuilder::new();
+        builder.push(Field::new("a", DataType::Int32, false));
+        builder.push(Field::new("b", DataType::Utf8, true));
+        builder.reverse();
+        assert_eq!(
+            builder.fields,
+            vec![
+                Arc::new(Field::new("b", DataType::Utf8, true)),
+                Arc::new(Field::new("a", DataType::Int32, false))
+            ]
+        );
+    }
+
+    #[test]
+    fn test_schema_builder_metadata() {
+        let mut metadata = HashMap::with_capacity(1);
+        metadata.insert("key".to_string(), "value".to_string());
+
+        let fields = vec![Field::new("test", DataType::Int8, true)];
+        let mut builder: SchemaBuilder = Schema::new(fields).with_metadata(metadata).into();
+        builder.metadata_mut().insert("k".into(), "v".into());
+        let out = builder.finish();
+        assert_eq!(out.metadata.len(), 2);
+        assert_eq!(out.metadata["k"], "v");
+        assert_eq!(out.metadata["key"], "value");
     }
 }

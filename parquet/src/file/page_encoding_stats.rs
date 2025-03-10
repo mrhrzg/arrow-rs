@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Per-page encoding information.
+
 use crate::basic::{Encoding, PageType};
 use crate::errors::Result;
 use crate::format::{
@@ -33,9 +35,7 @@ pub struct PageEncodingStats {
 }
 
 /// Converts Thrift definition into `PageEncodingStats`.
-pub fn try_from_thrift(
-    thrift_encoding_stats: &TPageEncodingStats,
-) -> Result<PageEncodingStats> {
+pub fn try_from_thrift(thrift_encoding_stats: &TPageEncodingStats) -> Result<PageEncodingStats> {
     let page_type = PageType::try_from(thrift_encoding_stats.page_type)?;
     let encoding = Encoding::try_from(thrift_encoding_stats.encoding)?;
     let count = thrift_encoding_stats.count;
@@ -63,7 +63,6 @@ pub fn to_thrift(encoding_stats: &PageEncodingStats) -> TPageEncodingStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basic::{Encoding, PageType};
 
     #[test]
     fn test_page_encoding_stats_from_thrift() {

@@ -15,18 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::i256;
+use crate::{i256, IntervalDayTime, IntervalMonthDayNano};
 use half::f16;
 
 mod private {
     pub trait Sealed {}
 }
 
-/// Trait expressing a Rust type that has the same in-memory representation
-/// as Arrow. This includes `i16`, `f32`, but excludes `bool` (which in arrow is represented in bits).
+/// Trait expressing a Rust type that has the same in-memory representation as
+/// Arrow.
 ///
-/// In little endian machines, types that implement [`ArrowNativeType`] can be memcopied to arrow buffers
-/// as is.
+/// This includes `i16`, `f32`, but excludes `bool` (which in arrow is
+/// represented in bits).
+///
+/// In little endian machines, types that implement [`ArrowNativeType`] can be
+/// memcopied to arrow buffers as is.
 ///
 /// # Transmute Safety
 ///
@@ -47,6 +50,11 @@ mod private {
 pub trait ArrowNativeType:
     std::fmt::Debug + Send + Sync + Copy + PartialOrd + Default + private::Sealed + 'static
 {
+    /// Returns the byte width of this native type.
+    fn get_byte_width() -> usize {
+        std::mem::size_of::<Self>()
+    }
+
     /// Convert native integer type from usize
     ///
     /// Returns `None` if [`Self`] is not an integer or conversion would result
@@ -57,6 +65,11 @@ pub trait ArrowNativeType:
     ///
     /// [`as`]: https://doc.rust-lang.org/reference/expressions/operator-expr.html#numeric-cast
     fn as_usize(self) -> usize;
+
+    /// Convert from usize according to the [`as`] operator
+    ///
+    /// [`as`]: https://doc.rust-lang.org/reference/expressions/operator-expr.html#numeric-cast
+    fn usize_as(i: usize) -> Self;
 
     /// Convert native type to usize.
     ///
@@ -70,29 +83,11 @@ pub trait ArrowNativeType:
     /// in truncation/overflow
     fn to_isize(self) -> Option<isize>;
 
-    /// Convert native type from i32.
+    /// Convert native type to i64.
     ///
-    /// Returns `None` if [`Self`] is not `i32`
-    #[deprecated(note = "please use `Option::Some` instead")]
-    fn from_i32(_: i32) -> Option<Self> {
-        None
-    }
-
-    /// Convert native type from i64.
-    ///
-    /// Returns `None` if [`Self`] is not `i64`
-    #[deprecated(note = "please use `Option::Some` instead")]
-    fn from_i64(_: i64) -> Option<Self> {
-        None
-    }
-
-    /// Convert native type from i128.
-    ///
-    /// Returns `None` if [`Self`] is not `i128`
-    #[deprecated(note = "please use `Option::Some` instead")]
-    fn from_i128(_: i128) -> Option<Self> {
-        None
-    }
+    /// Returns `None` if [`Self`] is not an integer or conversion would result
+    /// in truncation/overflow
+    fn to_i64(self) -> Option<i64>;
 }
 
 macro_rules! native_integer {
@@ -115,32 +110,36 @@ macro_rules! native_integer {
             }
 
             #[inline]
+            fn to_i64(self) -> Option<i64> {
+                self.try_into().ok()
+            }
+
+            #[inline]
             fn as_usize(self) -> usize {
                 self as _
             }
 
-            $(
-                #[inline]
-                fn $from(v: $t) -> Option<Self> {
-                    Some(v)
-                }
-            )*
+            #[inline]
+            fn usize_as(i: usize) -> Self {
+                i as _
+            }
         }
     };
 }
 
 native_integer!(i8);
 native_integer!(i16);
-native_integer!(i32, from_i32);
-native_integer!(i64, from_i64);
-native_integer!(i128, from_i128);
+native_integer!(i32);
+native_integer!(i64);
+native_integer!(i128);
 native_integer!(u8);
 native_integer!(u16);
 native_integer!(u32);
 native_integer!(u64);
+native_integer!(u128);
 
 macro_rules! native_float {
-    ($t:ty, $s:ident, $as_usize: expr) => {
+    ($t:ty, $s:ident, $as_usize: expr, $i:ident, $usize_as: expr) => {
         impl private::Sealed for $t {}
         impl ArrowNativeType for $t {
             #[inline]
@@ -159,16 +158,26 @@ macro_rules! native_float {
             }
 
             #[inline]
+            fn to_i64(self) -> Option<i64> {
+                None
+            }
+
+            #[inline]
             fn as_usize($s) -> usize {
                 $as_usize
+            }
+
+            #[inline]
+            fn usize_as($i: usize) -> Self {
+                $usize_as
             }
         }
     };
 }
 
-native_float!(f16, self, self.to_f32() as _);
-native_float!(f32, self, self as _);
-native_float!(f64, self, self as _);
+native_float!(f16, self, self.to_f32() as _, i, f16::from_f32(i as _));
+native_float!(f32, self, self as _, i, i as _);
+native_float!(f64, self, self as _, i, i as _);
 
 impl private::Sealed for i256 {}
 impl ArrowNativeType for i256 {
@@ -178,6 +187,10 @@ impl ArrowNativeType for i256 {
 
     fn as_usize(self) -> usize {
         self.to_parts().0 as usize
+    }
+
+    fn usize_as(i: usize) -> Self {
+        Self::from_parts(i as u128, 0)
     }
 
     fn to_usize(self) -> Option<usize> {
@@ -191,6 +204,64 @@ impl ArrowNativeType for i256 {
     fn to_isize(self) -> Option<isize> {
         self.to_i128()?.try_into().ok()
     }
+
+    fn to_i64(self) -> Option<i64> {
+        self.to_i128()?.try_into().ok()
+    }
+}
+
+impl private::Sealed for IntervalMonthDayNano {}
+impl ArrowNativeType for IntervalMonthDayNano {
+    fn from_usize(_: usize) -> Option<Self> {
+        None
+    }
+
+    fn as_usize(self) -> usize {
+        ((self.months as u64) | ((self.days as u64) << 32)) as usize
+    }
+
+    fn usize_as(i: usize) -> Self {
+        Self::new(i as _, ((i as u64) >> 32) as _, 0)
+    }
+
+    fn to_usize(self) -> Option<usize> {
+        None
+    }
+
+    fn to_isize(self) -> Option<isize> {
+        None
+    }
+
+    fn to_i64(self) -> Option<i64> {
+        None
+    }
+}
+
+impl private::Sealed for IntervalDayTime {}
+impl ArrowNativeType for IntervalDayTime {
+    fn from_usize(_: usize) -> Option<Self> {
+        None
+    }
+
+    fn as_usize(self) -> usize {
+        ((self.days as u64) | ((self.milliseconds as u64) << 32)) as usize
+    }
+
+    fn usize_as(i: usize) -> Self {
+        Self::new(i as _, ((i as u64) >> 32) as _)
+    }
+
+    fn to_usize(self) -> Option<usize> {
+        None
+    }
+
+    fn to_isize(self) -> Option<isize> {
+        None
+    }
+
+    fn to_i64(self) -> Option<i64> {
+        None
+    }
 }
 
 /// Allows conversion from supported Arrow types to a byte slice.
@@ -202,10 +273,8 @@ pub trait ToByteSlice {
 impl<T: ArrowNativeType> ToByteSlice for [T] {
     #[inline]
     fn to_byte_slice(&self) -> &[u8] {
-        let raw_ptr = self.as_ptr() as *const T as *const u8;
-        unsafe {
-            std::slice::from_raw_parts(raw_ptr, self.len() * std::mem::size_of::<T>())
-        }
+        let raw_ptr = self.as_ptr() as *const u8;
+        unsafe { std::slice::from_raw_parts(raw_ptr, std::mem::size_of_val(self)) }
     }
 }
 
@@ -237,5 +306,19 @@ mod tests {
         assert_eq!(a.as_usize(), usize::MAX);
         assert!(a.to_usize().is_none());
         assert_eq!(a.to_isize().unwrap(), -1);
+    }
+
+    #[test]
+    fn test_interval_usize() {
+        assert_eq!(IntervalDayTime::new(1, 0).as_usize(), 1);
+        assert_eq!(IntervalMonthDayNano::new(1, 0, 0).as_usize(), 1);
+
+        let a = IntervalDayTime::new(23, 53);
+        let b = IntervalDayTime::usize_as(a.as_usize());
+        assert_eq!(a, b);
+
+        let a = IntervalMonthDayNano::new(23, 53, 0);
+        let b = IntervalMonthDayNano::usize_as(a.as_usize());
+        assert_eq!(a, b);
     }
 }

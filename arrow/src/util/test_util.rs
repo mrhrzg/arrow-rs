@@ -78,7 +78,7 @@ pub fn get_temp_file(file_name: &str, content: &[u8]) -> fs::File {
 pub fn arrow_test_data() -> String {
     match get_data_dir("ARROW_TEST_DATA", "../testing/data") {
         Ok(pb) => pb.display().to_string(),
-        Err(err) => panic!("failed to get arrow data dir: {}", err),
+        Err(err) => panic!("failed to get arrow data dir: {err}"),
     }
 }
 
@@ -100,7 +100,7 @@ pub fn arrow_test_data() -> String {
 pub fn parquet_test_data() -> String {
     match get_data_dir("PARQUET_TEST_DATA", "../parquet-testing/data") {
         Ok(pb) => pb.display().to_string(),
-        Err(err) => panic!("failed to get parquet data dir: {}", err),
+        Err(err) => panic!("failed to get parquet data dir: {err}"),
     }
 }
 
@@ -196,14 +196,13 @@ impl<T: Clone> Iterator for BadIterator<T> {
 
     /// report whatever the iterator says to
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.claimed as usize))
+        (0, Some(self.claimed))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     #[test]
     fn test_data_dir() {

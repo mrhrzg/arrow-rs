@@ -17,60 +17,155 @@
 
 //! Utilities for converting between IPC types and native Arrow types
 
+use arrow_buffer::Buffer;
 use arrow_schema::*;
 use flatbuffers::{
-    FlatBufferBuilder, ForwardsUOffset, UnionWIPOffset, Vector, WIPOffset,
+    FlatBufferBuilder, ForwardsUOffset, UnionWIPOffset, Vector, Verifiable, Verifier,
+    VerifierOptions, WIPOffset,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 
-use crate::{size_prefixed_root_as_message, CONTINUATION_MARKER};
+use crate::writer::DictionaryTracker;
+use crate::{size_prefixed_root_as_message, KeyValue, Message, CONTINUATION_MARKER};
 use DataType::*;
 
-/// Serialize a schema in IPC format
-pub fn schema_to_fb(schema: &Schema) -> FlatBufferBuilder {
-    let mut fbb = FlatBufferBuilder::new();
-
-    let root = schema_to_fb_offset(&mut fbb, schema);
-
-    fbb.finish(root, None);
-
-    fbb
+/// Low level Arrow [Schema] to IPC bytes converter
+///
+/// See also [`fb_to_schema`] for the reverse operation
+///
+/// # Example
+/// ```
+/// # use arrow_ipc::convert::{fb_to_schema, IpcSchemaEncoder};
+/// # use arrow_ipc::root_as_schema;
+/// # use arrow_ipc::writer::DictionaryTracker;
+/// # use arrow_schema::{DataType, Field, Schema};
+/// // given an arrow schema to serialize
+/// let schema = Schema::new(vec![
+///    Field::new("a", DataType::Int32, false),
+/// ]);
+///
+/// // Use a dictionary tracker to track dictionary id if needed
+///  let mut dictionary_tracker = DictionaryTracker::new(true);
+/// // create a FlatBuffersBuilder that contains the encoded bytes
+///  let fb = IpcSchemaEncoder::new()
+///    .with_dictionary_tracker(&mut dictionary_tracker)
+///    .schema_to_fb(&schema);
+///
+/// // the bytes are in `fb.finished_data()`
+/// let ipc_bytes = fb.finished_data();
+///
+///  // convert the IPC bytes back to an Arrow schema
+///  let ipc_schema = root_as_schema(ipc_bytes).unwrap();
+///  let schema2 = fb_to_schema(ipc_schema);
+/// assert_eq!(schema, schema2);
+/// ```
+#[derive(Debug)]
+pub struct IpcSchemaEncoder<'a> {
+    dictionary_tracker: Option<&'a mut DictionaryTracker>,
 }
 
+impl Default for IpcSchemaEncoder<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> IpcSchemaEncoder<'a> {
+    /// Create a new schema encoder
+    pub fn new() -> IpcSchemaEncoder<'a> {
+        IpcSchemaEncoder {
+            dictionary_tracker: None,
+        }
+    }
+
+    /// Specify a dictionary tracker to use
+    pub fn with_dictionary_tracker(
+        mut self,
+        dictionary_tracker: &'a mut DictionaryTracker,
+    ) -> Self {
+        self.dictionary_tracker = Some(dictionary_tracker);
+        self
+    }
+
+    /// Serialize a schema in IPC format, returning a completed [`FlatBufferBuilder`]
+    ///
+    /// Note: Call [`FlatBufferBuilder::finished_data`] to get the serialized bytes
+    pub fn schema_to_fb<'b>(&mut self, schema: &Schema) -> FlatBufferBuilder<'b> {
+        let mut fbb = FlatBufferBuilder::new();
+
+        let root = self.schema_to_fb_offset(&mut fbb, schema);
+
+        fbb.finish(root, None);
+
+        fbb
+    }
+
+    /// Serialize a schema to an in progress [`FlatBufferBuilder`], returning the in progress offset.
+    pub fn schema_to_fb_offset<'b>(
+        &mut self,
+        fbb: &mut FlatBufferBuilder<'b>,
+        schema: &Schema,
+    ) -> WIPOffset<crate::Schema<'b>> {
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|field| build_field(fbb, &mut self.dictionary_tracker, field))
+            .collect::<Vec<_>>();
+        let fb_field_list = fbb.create_vector(&fields);
+
+        let fb_metadata_list =
+            (!schema.metadata().is_empty()).then(|| metadata_to_fb(fbb, schema.metadata()));
+
+        let mut builder = crate::SchemaBuilder::new(fbb);
+        builder.add_fields(fb_field_list);
+        if let Some(fb_metadata_list) = fb_metadata_list {
+            builder.add_custom_metadata(fb_metadata_list);
+        }
+        builder.finish()
+    }
+}
+
+/// Serialize a schema in IPC format
+#[deprecated(since = "54.0.0", note = "Use `IpcSchemaConverter`.")]
+pub fn schema_to_fb(schema: &Schema) -> FlatBufferBuilder<'_> {
+    IpcSchemaEncoder::new().schema_to_fb(schema)
+}
+
+/// Push a key-value metadata into a FlatBufferBuilder and return [WIPOffset]
+pub fn metadata_to_fb<'a>(
+    fbb: &mut FlatBufferBuilder<'a>,
+    metadata: &HashMap<String, String>,
+) -> WIPOffset<Vector<'a, ForwardsUOffset<KeyValue<'a>>>> {
+    let custom_metadata = metadata
+        .iter()
+        .map(|(k, v)| {
+            let fb_key_name = fbb.create_string(k);
+            let fb_val_name = fbb.create_string(v);
+
+            let mut kv_builder = crate::KeyValueBuilder::new(fbb);
+            kv_builder.add_key(fb_key_name);
+            kv_builder.add_value(fb_val_name);
+            kv_builder.finish()
+        })
+        .collect::<Vec<_>>();
+    fbb.create_vector(&custom_metadata)
+}
+
+/// Adds a [Schema] to a flatbuffer and returns the offset
 pub fn schema_to_fb_offset<'a>(
     fbb: &mut FlatBufferBuilder<'a>,
     schema: &Schema,
 ) -> WIPOffset<crate::Schema<'a>> {
-    let mut fields = vec![];
-    for field in schema.fields() {
-        let fb_field = build_field(fbb, field);
-        fields.push(fb_field);
-    }
-
-    let mut custom_metadata = vec![];
-    for (k, v) in schema.metadata() {
-        let fb_key_name = fbb.create_string(k.as_str());
-        let fb_val_name = fbb.create_string(v.as_str());
-
-        let mut kv_builder = crate::KeyValueBuilder::new(fbb);
-        kv_builder.add_key(fb_key_name);
-        kv_builder.add_value(fb_val_name);
-        custom_metadata.push(kv_builder.finish());
-    }
-
-    let fb_field_list = fbb.create_vector(&fields);
-    let fb_metadata_list = fbb.create_vector(&custom_metadata);
-
-    let mut builder = crate::SchemaBuilder::new(fbb);
-    builder.add_fields(fb_field_list);
-    builder.add_custom_metadata(fb_metadata_list);
-    builder.finish()
+    IpcSchemaEncoder::new().schema_to_fb_offset(fbb, schema)
 }
 
 /// Convert an IPC Field to Arrow Field
-impl<'a> From<crate::Field<'a>> for Field {
+impl From<crate::Field<'_>> for Field {
     fn from(field: crate::Field) -> Field {
         let arrow_field = if let Some(dictionary) = field.dictionary() {
+            #[allow(deprecated)]
             Field::new_dict(
                 field.name().unwrap(),
                 get_data_type(field, true),
@@ -86,22 +181,20 @@ impl<'a> From<crate::Field<'a>> for Field {
             )
         };
 
-        let mut metadata = None;
+        let mut metadata_map = HashMap::default();
         if let Some(list) = field.custom_metadata() {
-            let mut metadata_map = BTreeMap::default();
             for kv in list {
                 if let (Some(k), Some(v)) = (kv.key(), kv.value()) {
                     metadata_map.insert(k.to_string(), v.to_string());
                 }
             }
-            metadata = Some(metadata_map);
         }
 
-        arrow_field.with_metadata(metadata)
+        arrow_field.with_metadata(metadata_map)
     }
 }
 
-/// Deserialize a Schema table from flat buffer format to Schema data type
+/// Deserialize an ipc [crate::Schema`] from flat buffers to an arrow [Schema].
 pub fn fb_to_schema(fb: crate::Schema) -> Schema {
     let mut fields: Vec<Field> = vec![];
     let c_fields = fb.fields().unwrap();
@@ -140,12 +233,12 @@ pub fn try_schema_from_flatbuffer_bytes(bytes: &[u8]) -> Result<Schema, ArrowErr
         if let Some(schema) = ipc.header_as_schema().map(fb_to_schema) {
             Ok(schema)
         } else {
-            Err(ArrowError::IoError(
+            Err(ArrowError::ParseError(
                 "Unable to get head as schema".to_string(),
             ))
         }
     } else {
-        Err(ArrowError::IoError(
+        Err(ArrowError::ParseError(
             "Unable to get root as message".to_string(),
         ))
     }
@@ -154,7 +247,7 @@ pub fn try_schema_from_flatbuffer_bytes(bytes: &[u8]) -> Result<Schema, ArrowErr
 /// Try deserialize the IPC format bytes into a schema
 pub fn try_schema_from_ipc_buffer(buffer: &[u8]) -> Result<Schema, ArrowError> {
     // There are two protocol types: https://issues.apache.org/jira/browse/ARROW-6313
-    // The original protocal is:
+    // The original protocol is:
     //   4 bytes - the byte length of the payload
     //   a flatbuffer Message whose header is the Schema
     // The latest version of protocol is:
@@ -163,35 +256,29 @@ pub fn try_schema_from_ipc_buffer(buffer: &[u8]) -> Result<Schema, ArrowError> {
     //   4 bytes - the byte length of the payload
     //   a flatbuffer Message whose header is the Schema
     if buffer.len() >= 4 {
-        // check continuation maker
-        let continuation_maker = &buffer[0..4];
-        let begin_offset: usize = if continuation_maker.eq(&CONTINUATION_MARKER) {
+        // check continuation marker
+        let continuation_marker = &buffer[0..4];
+        let begin_offset: usize = if continuation_marker.eq(&CONTINUATION_MARKER) {
             // 4 bytes: CONTINUATION_MARKER
             // 4 bytes: length
             // buffer
             4
         } else {
-            // backward compatibility for buffer without the continuation maker
+            // backward compatibility for buffer without the continuation marker
             // 4 bytes: length
             // buffer
             0
         };
-        let msg =
-            size_prefixed_root_as_message(&buffer[begin_offset..]).map_err(|err| {
-                ArrowError::ParseError(format!(
-                    "Unable to convert flight info to a message: {}",
-                    err
-                ))
-            })?;
+        let msg = size_prefixed_root_as_message(&buffer[begin_offset..]).map_err(|err| {
+            ArrowError::ParseError(format!("Unable to convert flight info to a message: {err}"))
+        })?;
         let ipc_schema = msg.header_as_schema().ok_or_else(|| {
-            ArrowError::ParseError(
-                "Unable to convert flight info to a schema".to_string(),
-            )
+            ArrowError::ParseError("Unable to convert flight info to a schema".to_string())
         })?;
         Ok(fb_to_schema(ipc_schema))
     } else {
         Err(ArrowError::ParseError(
-            "The buffer length is less than 4 and missing the continuation maker or length of buffer".to_string()
+            "The buffer length is less than 4 and missing the continuation marker or length of buffer".to_string()
         ))
     }
 }
@@ -240,8 +327,10 @@ pub(crate) fn get_data_type(field: crate::Field, may_be_dictionary: bool) -> Dat
             }
         }
         crate::Type::Binary => DataType::Binary,
+        crate::Type::BinaryView => DataType::BinaryView,
         crate::Type::LargeBinary => DataType::LargeBinary,
         crate::Type::Utf8 => DataType::Utf8,
+        crate::Type::Utf8View => DataType::Utf8View,
         crate::Type::LargeUtf8 => DataType::LargeUtf8,
         crate::Type::FixedSizeBinary => {
             let fsb = field.type_as_fixed_size_binary().unwrap();
@@ -253,7 +342,7 @@ pub(crate) fn get_data_type(field: crate::Field, may_be_dictionary: bool) -> Dat
                 crate::Precision::HALF => DataType::Float16,
                 crate::Precision::SINGLE => DataType::Float32,
                 crate::Precision::DOUBLE => DataType::Float64,
-                z => panic!("FloatingPoint type with precision of {:?} not supported", z),
+                z => panic!("FloatingPoint type with precision of {z:?} not supported"),
             }
         }
         crate::Type::Date => {
@@ -261,22 +350,16 @@ pub(crate) fn get_data_type(field: crate::Field, may_be_dictionary: bool) -> Dat
             match date.unit() {
                 crate::DateUnit::DAY => DataType::Date32,
                 crate::DateUnit::MILLISECOND => DataType::Date64,
-                z => panic!("Date type with unit of {:?} not supported", z),
+                z => panic!("Date type with unit of {z:?} not supported"),
             }
         }
         crate::Type::Time => {
             let time = field.type_as_time().unwrap();
             match (time.bitWidth(), time.unit()) {
                 (32, crate::TimeUnit::SECOND) => DataType::Time32(TimeUnit::Second),
-                (32, crate::TimeUnit::MILLISECOND) => {
-                    DataType::Time32(TimeUnit::Millisecond)
-                }
-                (64, crate::TimeUnit::MICROSECOND) => {
-                    DataType::Time64(TimeUnit::Microsecond)
-                }
-                (64, crate::TimeUnit::NANOSECOND) => {
-                    DataType::Time64(TimeUnit::Nanosecond)
-                }
+                (32, crate::TimeUnit::MILLISECOND) => DataType::Time32(TimeUnit::Millisecond),
+                (64, crate::TimeUnit::MICROSECOND) => DataType::Time64(TimeUnit::Microsecond),
+                (64, crate::TimeUnit::NANOSECOND) => DataType::Time64(TimeUnit::Nanosecond),
                 z => panic!(
                     "Time type with bit width of {} and unit of {:?} not supported",
                     z.0, z.1
@@ -285,36 +368,28 @@ pub(crate) fn get_data_type(field: crate::Field, may_be_dictionary: bool) -> Dat
         }
         crate::Type::Timestamp => {
             let timestamp = field.type_as_timestamp().unwrap();
-            let timezone: Option<String> = timestamp.timezone().map(|tz| tz.to_string());
+            let timezone: Option<_> = timestamp.timezone().map(|tz| tz.into());
             match timestamp.unit() {
-                crate::TimeUnit::SECOND => {
-                    DataType::Timestamp(TimeUnit::Second, timezone)
-                }
+                crate::TimeUnit::SECOND => DataType::Timestamp(TimeUnit::Second, timezone),
                 crate::TimeUnit::MILLISECOND => {
                     DataType::Timestamp(TimeUnit::Millisecond, timezone)
                 }
                 crate::TimeUnit::MICROSECOND => {
                     DataType::Timestamp(TimeUnit::Microsecond, timezone)
                 }
-                crate::TimeUnit::NANOSECOND => {
-                    DataType::Timestamp(TimeUnit::Nanosecond, timezone)
-                }
-                z => panic!("Timestamp type with unit of {:?} not supported", z),
+                crate::TimeUnit::NANOSECOND => DataType::Timestamp(TimeUnit::Nanosecond, timezone),
+                z => panic!("Timestamp type with unit of {z:?} not supported"),
             }
         }
         crate::Type::Interval => {
             let interval = field.type_as_interval().unwrap();
             match interval.unit() {
-                crate::IntervalUnit::YEAR_MONTH => {
-                    DataType::Interval(IntervalUnit::YearMonth)
-                }
-                crate::IntervalUnit::DAY_TIME => {
-                    DataType::Interval(IntervalUnit::DayTime)
-                }
+                crate::IntervalUnit::YEAR_MONTH => DataType::Interval(IntervalUnit::YearMonth),
+                crate::IntervalUnit::DAY_TIME => DataType::Interval(IntervalUnit::DayTime),
                 crate::IntervalUnit::MONTH_DAY_NANO => {
                     DataType::Interval(IntervalUnit::MonthDayNano)
                 }
-                z => panic!("Interval type with unit of {:?} unsupported", z),
+                z => panic!("Interval type with unit of {z:?} unsupported"),
             }
         }
         crate::Type::Duration => {
@@ -324,7 +399,7 @@ pub(crate) fn get_data_type(field: crate::Field, may_be_dictionary: bool) -> Dat
                 crate::TimeUnit::MILLISECOND => DataType::Duration(TimeUnit::Millisecond),
                 crate::TimeUnit::MICROSECOND => DataType::Duration(TimeUnit::Microsecond),
                 crate::TimeUnit::NANOSECOND => DataType::Duration(TimeUnit::Nanosecond),
-                z => panic!("Duration type with unit of {:?} unsupported", z),
+                z => panic!("Duration type with unit of {z:?} unsupported"),
             }
         }
         crate::Type::List => {
@@ -332,14 +407,14 @@ pub(crate) fn get_data_type(field: crate::Field, may_be_dictionary: bool) -> Dat
             if children.len() != 1 {
                 panic!("expect a list to have one child")
             }
-            DataType::List(Box::new(children.get(0).into()))
+            DataType::List(Arc::new(children.get(0).into()))
         }
         crate::Type::LargeList => {
             let children = field.children().unwrap();
             if children.len() != 1 {
                 panic!("expect a large list to have one child")
             }
-            DataType::LargeList(Box::new(children.get(0).into()))
+            DataType::LargeList(Arc::new(children.get(0).into()))
         }
         crate::Type::FixedSizeList => {
             let children = field.children().unwrap();
@@ -347,17 +422,26 @@ pub(crate) fn get_data_type(field: crate::Field, may_be_dictionary: bool) -> Dat
                 panic!("expect a list to have one child")
             }
             let fsl = field.type_as_fixed_size_list().unwrap();
-            DataType::FixedSizeList(Box::new(children.get(0).into()), fsl.listSize())
+            DataType::FixedSizeList(Arc::new(children.get(0).into()), fsl.listSize())
         }
         crate::Type::Struct_ => {
-            let mut fields = vec![];
-            if let Some(children) = field.children() {
-                for i in 0..children.len() {
-                    fields.push(children.get(i).into());
-                }
+            let fields = match field.children() {
+                Some(children) => children.iter().map(Field::from).collect(),
+                None => Fields::empty(),
             };
-
             DataType::Struct(fields)
+        }
+        crate::Type::RunEndEncoded => {
+            let children = field.children().unwrap();
+            if children.len() != 2 {
+                panic!(
+                    "RunEndEncoded type should have exactly two children. Found {}",
+                    children.len()
+                )
+            }
+            let run_ends_field = children.get(0).into();
+            let values_field = children.get(1).into();
+            DataType::RunEndEncoded(Arc::new(run_ends_field), Arc::new(values_field))
         }
         crate::Type::Map => {
             let map = field.type_as_map().unwrap();
@@ -365,23 +449,17 @@ pub(crate) fn get_data_type(field: crate::Field, may_be_dictionary: bool) -> Dat
             if children.len() != 1 {
                 panic!("expect a map to have one child")
             }
-            DataType::Map(Box::new(children.get(0).into()), map.keysSorted())
+            DataType::Map(Arc::new(children.get(0).into()), map.keysSorted())
         }
         crate::Type::Decimal => {
             let fsb = field.type_as_decimal().unwrap();
             let bit_width = fsb.bitWidth();
-            if bit_width == 128 {
-                DataType::Decimal128(
-                    fsb.precision().try_into().unwrap(),
-                    fsb.scale().try_into().unwrap(),
-                )
-            } else if bit_width == 256 {
-                DataType::Decimal256(
-                    fsb.precision().try_into().unwrap(),
-                    fsb.scale().try_into().unwrap(),
-                )
-            } else {
-                panic!("Unexpected decimal bit width {}", bit_width)
+            let precision: u8 = fsb.precision().try_into().unwrap();
+            let scale: i8 = fsb.scale().try_into().unwrap();
+            match bit_width {
+                128 => DataType::Decimal128(precision, scale),
+                256 => DataType::Decimal256(precision, scale),
+                _ => panic!("Unexpected decimal bit width {bit_width}"),
             }
         }
         crate::Type::Union => {
@@ -390,22 +468,22 @@ pub(crate) fn get_data_type(field: crate::Field, may_be_dictionary: bool) -> Dat
             let union_mode = match union.mode() {
                 crate::UnionMode::Dense => UnionMode::Dense,
                 crate::UnionMode::Sparse => UnionMode::Sparse,
-                mode => panic!("Unexpected union mode: {:?}", mode),
+                mode => panic!("Unexpected union mode: {mode:?}"),
             };
 
             let mut fields = vec![];
             if let Some(children) = field.children() {
                 for i in 0..children.len() {
-                    fields.push(children.get(i).into());
+                    fields.push(Field::from(children.get(i)));
                 }
             };
 
-            let type_ids: Vec<i8> = match union.typeIds() {
-                None => (0_i8..fields.len() as i8).collect(),
-                Some(ids) => ids.iter().map(|i| i as i8).collect(),
+            let fields = match union.typeIds() {
+                None => UnionFields::new(0_i8..fields.len() as i8, fields),
+                Some(ids) => UnionFields::new(ids.iter().map(|i| i as i8), fields),
             };
 
-            DataType::Union(fields, type_ids, union_mode)
+            DataType::Union(fields, union_mode)
         }
         t => unimplemented!("Type {:?} not supported", t),
     }
@@ -420,39 +498,41 @@ pub(crate) struct FBFieldType<'b> {
 /// Create an IPC Field from an Arrow Field
 pub(crate) fn build_field<'a>(
     fbb: &mut FlatBufferBuilder<'a>,
+    dictionary_tracker: &mut Option<&mut DictionaryTracker>,
     field: &Field,
 ) -> WIPOffset<crate::Field<'a>> {
     // Optional custom metadata.
     let mut fb_metadata = None;
-    if let Some(metadata) = field.metadata() {
-        if !metadata.is_empty() {
-            let mut kv_vec = vec![];
-            for (k, v) in metadata {
-                let kv_args = crate::KeyValueArgs {
-                    key: Some(fbb.create_string(k.as_str())),
-                    value: Some(fbb.create_string(v.as_str())),
-                };
-                let kv_offset = crate::KeyValue::create(fbb, &kv_args);
-                kv_vec.push(kv_offset);
-            }
-            fb_metadata = Some(fbb.create_vector(&kv_vec));
-        }
+    if !field.metadata().is_empty() {
+        fb_metadata = Some(metadata_to_fb(fbb, field.metadata()));
     };
 
     let fb_field_name = fbb.create_string(field.name().as_str());
-    let field_type = get_fb_field_type(field.data_type(), fbb);
+    let field_type = get_fb_field_type(field.data_type(), dictionary_tracker, fbb);
 
     let fb_dictionary = if let Dictionary(index_type, _) = field.data_type() {
-        Some(get_fb_dictionary(
-            index_type,
-            field
-                .dict_id()
-                .expect("All Dictionary types have `dict_id`"),
-            field
-                .dict_is_ordered()
-                .expect("All Dictionary types have `dict_is_ordered`"),
-            fbb,
-        ))
+        match dictionary_tracker {
+            Some(tracker) => Some(get_fb_dictionary(
+                index_type,
+                #[allow(deprecated)]
+                tracker.set_dict_id(field),
+                field
+                    .dict_is_ordered()
+                    .expect("All Dictionary types have `dict_is_ordered`"),
+                fbb,
+            )),
+            None => Some(get_fb_dictionary(
+                index_type,
+                #[allow(deprecated)]
+                field
+                    .dict_id()
+                    .expect("Dictionary type must have a dictionary id"),
+                field
+                    .dict_is_ordered()
+                    .expect("All Dictionary types have `dict_is_ordered`"),
+                fbb,
+            )),
+        }
     } else {
         None
     };
@@ -480,6 +560,7 @@ pub(crate) fn build_field<'a>(
 /// Get the IPC type of a data type
 pub(crate) fn get_fb_field_type<'a>(
     data_type: &DataType,
+    dictionary_tracker: &mut Option<&mut DictionaryTracker>,
     fbb: &mut FlatBufferBuilder<'a>,
 ) -> FBFieldType<'a> {
     // some IPC implementations expect an empty list for child data, instead of a null value.
@@ -557,6 +638,16 @@ pub(crate) fn get_fb_field_type<'a>(
                 .as_union_value(),
             children: Some(fbb.create_vector(&empty_fields[..])),
         },
+        BinaryView => FBFieldType {
+            type_type: crate::Type::BinaryView,
+            type_: crate::BinaryViewBuilder::new(fbb).finish().as_union_value(),
+            children: Some(fbb.create_vector(&empty_fields[..])),
+        },
+        Utf8View => FBFieldType {
+            type_type: crate::Type::Utf8View,
+            type_: crate::Utf8ViewBuilder::new(fbb).finish().as_union_value(),
+            children: Some(fbb.create_vector(&empty_fields[..])),
+        },
         Utf8 => FBFieldType {
             type_type: crate::Type::Utf8,
             type_: crate::Utf8Builder::new(fbb).finish().as_union_value(),
@@ -569,7 +660,7 @@ pub(crate) fn get_fb_field_type<'a>(
         },
         FixedSizeBinary(len) => {
             let mut builder = crate::FixedSizeBinaryBuilder::new(fbb);
-            builder.add_byteWidth(*len as i32);
+            builder.add_byteWidth(*len);
             FBFieldType {
                 type_type: crate::Type::FixedSizeBinary,
                 type_: builder.finish().as_union_value(),
@@ -621,8 +712,8 @@ pub(crate) fn get_fb_field_type<'a>(
             }
         }
         Timestamp(unit, tz) => {
-            let tz = tz.clone().unwrap_or_default();
-            let tz_str = fbb.create_string(tz.as_str());
+            let tz = tz.as_deref().unwrap_or_default();
+            let tz_str = fbb.create_string(tz);
             let mut builder = crate::TimestampBuilder::new(fbb);
             let time_unit = match unit {
                 TimeUnit::Second => crate::TimeUnit::SECOND,
@@ -670,15 +761,16 @@ pub(crate) fn get_fb_field_type<'a>(
             }
         }
         List(ref list_type) => {
-            let child = build_field(fbb, list_type);
+            let child = build_field(fbb, dictionary_tracker, list_type);
             FBFieldType {
                 type_type: crate::Type::List,
                 type_: crate::ListBuilder::new(fbb).finish().as_union_value(),
                 children: Some(fbb.create_vector(&[child])),
             }
         }
+        ListView(_) | LargeListView(_) => unimplemented!("ListView/LargeListView not implemented"),
         LargeList(ref list_type) => {
-            let child = build_field(fbb, list_type);
+            let child = build_field(fbb, dictionary_tracker, list_type);
             FBFieldType {
                 type_type: crate::Type::LargeList,
                 type_: crate::LargeListBuilder::new(fbb).finish().as_union_value(),
@@ -686,9 +778,9 @@ pub(crate) fn get_fb_field_type<'a>(
             }
         }
         FixedSizeList(ref list_type, len) => {
-            let child = build_field(fbb, list_type);
+            let child = build_field(fbb, dictionary_tracker, list_type);
             let mut builder = crate::FixedSizeListBuilder::new(fbb);
-            builder.add_listSize(*len as i32);
+            builder.add_listSize(*len);
             FBFieldType {
                 type_type: crate::Type::FixedSizeList,
                 type_: builder.finish().as_union_value(),
@@ -699,7 +791,7 @@ pub(crate) fn get_fb_field_type<'a>(
             // struct's fields are children
             let mut children = vec![];
             for field in fields {
-                children.push(build_field(fbb, field));
+                children.push(build_field(fbb, dictionary_tracker, field));
             }
             FBFieldType {
                 type_type: crate::Type::Struct_,
@@ -707,8 +799,20 @@ pub(crate) fn get_fb_field_type<'a>(
                 children: Some(fbb.create_vector(&children[..])),
             }
         }
+        RunEndEncoded(run_ends, values) => {
+            let run_ends_field = build_field(fbb, dictionary_tracker, run_ends);
+            let values_field = build_field(fbb, dictionary_tracker, values);
+            let children = [run_ends_field, values_field];
+            FBFieldType {
+                type_type: crate::Type::RunEndEncoded,
+                type_: crate::RunEndEncodedBuilder::new(fbb)
+                    .finish()
+                    .as_union_value(),
+                children: Some(fbb.create_vector(&children[..])),
+            }
+        }
         Map(map_field, keys_sorted) => {
-            let child = build_field(fbb, map_field);
+            let child = build_field(fbb, dictionary_tracker, map_field);
             let mut field_type = crate::MapBuilder::new(fbb);
             field_type.add_keysSorted(*keys_sorted);
             FBFieldType {
@@ -721,7 +825,7 @@ pub(crate) fn get_fb_field_type<'a>(
             // In this library, the dictionary "type" is a logical construct. Here we
             // pass through to the value type, as we've already captured the index
             // type in the DictionaryEncoding metadata in the parent field
-            get_fb_field_type(value_type, fbb)
+            get_fb_field_type(value_type, dictionary_tracker, fbb)
         }
         Decimal128(precision, scale) => {
             let mut builder = crate::DecimalBuilder::new(fbb);
@@ -745,10 +849,10 @@ pub(crate) fn get_fb_field_type<'a>(
                 children: Some(fbb.create_vector(&empty_fields[..])),
             }
         }
-        Union(fields, type_ids, mode) => {
+        Union(fields, mode) => {
             let mut children = vec![];
-            for field in fields {
-                children.push(build_field(fbb, field));
+            for (_, field) in fields.iter() {
+                children.push(build_field(fbb, dictionary_tracker, field));
             }
 
             let union_mode = match mode {
@@ -756,8 +860,8 @@ pub(crate) fn get_fb_field_type<'a>(
                 UnionMode::Dense => crate::UnionMode::Dense,
             };
 
-            let fbb_type_ids = fbb
-                .create_vector(&type_ids.iter().map(|t| *t as i32).collect::<Vec<_>>());
+            let fbb_type_ids =
+                fbb.create_vector(&fields.iter().map(|(t, _)| t as i32).collect::<Vec<_>>());
             let mut builder = crate::UnionBuilder::new(fbb);
             builder.add_mode(union_mode);
             builder.add_typeIds(fbb_type_ids);
@@ -806,6 +910,45 @@ pub(crate) fn get_fb_dictionary<'a>(
     builder.finish()
 }
 
+/// An owned container for a validated [`Message`]
+///
+/// Safely decoding a flatbuffer requires validating the various embedded offsets,
+/// see [`Verifier`]. This is a potentially expensive operation, and it is therefore desirable
+/// to only do this once. [`crate::root_as_message`] performs this validation on construction,
+/// however, it returns a [`Message`] borrowing the provided byte slice. This prevents
+/// storing this [`Message`] in the same data structure that owns the buffer, as this
+/// would require self-referential borrows.
+///
+/// [`MessageBuffer`] solves this problem by providing a safe API for a [`Message`]
+/// without a lifetime bound.
+#[derive(Clone)]
+pub struct MessageBuffer(Buffer);
+
+impl Debug for MessageBuffer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.as_ref().fmt(f)
+    }
+}
+
+impl MessageBuffer {
+    /// Try to create a [`MessageBuffer`] from the provided [`Buffer`]
+    pub fn try_new(buf: Buffer) -> Result<Self, ArrowError> {
+        let opts = VerifierOptions::default();
+        let mut v = Verifier::new(&opts, &buf);
+        <ForwardsUOffset<Message>>::run_verifier(&mut v, 0).map_err(|err| {
+            ArrowError::ParseError(format!("Unable to get root as message: {err:?}"))
+        })?;
+        Ok(Self(buf))
+    }
+
+    /// Return the [`Message`]
+    #[inline]
+    pub fn as_ref(&self) -> Message<'_> {
+        // SAFETY: Run verifier on construction
+        unsafe { crate::root_as_message_unchecked(&self.0) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,13 +959,13 @@ mod tests {
             .iter()
             .cloned()
             .collect();
-        let field_md: BTreeMap<String, String> = [("k".to_string(), "v".to_string())]
+        let field_md: HashMap<String, String> = [("k".to_string(), "v".to_string())]
             .iter()
             .cloned()
             .collect();
         let schema = Schema::new_with_metadata(
             vec![
-                Field::new("uint8", DataType::UInt8, false).with_metadata(Some(field_md)),
+                Field::new("uint8", DataType::UInt8, false).with_metadata(field_md),
                 Field::new("uint16", DataType::UInt16, true),
                 Field::new("uint32", DataType::UInt32, false),
                 Field::new("uint64", DataType::UInt64, true),
@@ -853,10 +996,7 @@ mod tests {
                 ),
                 Field::new(
                     "timestamp[us]",
-                    DataType::Timestamp(
-                        TimeUnit::Microsecond,
-                        Some("Africa/Johannesburg".to_string()),
-                    ),
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("Africa/Johannesburg".into())),
                     false,
                 ),
                 Field::new(
@@ -880,142 +1020,138 @@ mod tests {
                     true,
                 ),
                 Field::new("utf8", DataType::Utf8, false),
+                Field::new("utf8_view", DataType::Utf8View, false),
                 Field::new("binary", DataType::Binary, false),
-                Field::new(
+                Field::new("binary_view", DataType::BinaryView, false),
+                Field::new_list(
                     "list[u8]",
-                    DataType::List(Box::new(Field::new("item", DataType::UInt8, false))),
+                    Field::new_list_field(DataType::UInt8, false),
                     true,
                 ),
-                Field::new(
+                Field::new_fixed_size_list(
+                    "fixed_size_list[u8]",
+                    Field::new_list_field(DataType::UInt8, false),
+                    2,
+                    true,
+                ),
+                Field::new_list(
                     "list[struct<float32, int32, bool>]",
-                    DataType::List(Box::new(Field::new(
+                    Field::new_struct(
                         "struct",
-                        DataType::Struct(vec![
-                            Field::new("float32", DataType::UInt8, false),
-                            Field::new("int32", DataType::Int32, true),
-                            Field::new("bool", DataType::Boolean, true),
-                        ]),
-                        true,
-                    ))),
-                    false,
-                ),
-                Field::new(
-                    "struct<dictionary<int32, utf8>>",
-                    DataType::Struct(vec![Field::new(
-                        "dictionary<int32, utf8>",
-                        DataType::Dictionary(
-                            Box::new(DataType::Int32),
-                            Box::new(DataType::Utf8),
-                        ),
-                        false,
-                    )]),
-                    false,
-                ),
-                Field::new(
-                    "struct<int64, list[struct<date32, list[struct<>]>]>",
-                    DataType::Struct(vec![
-                        Field::new("int64", DataType::Int64, true),
-                        Field::new(
-                            "list[struct<date32, list[struct<>]>]",
-                            DataType::List(Box::new(Field::new(
-                                "struct",
-                                DataType::Struct(vec![
-                                    Field::new("date32", DataType::Date32, true),
-                                    Field::new(
-                                        "list[struct<>]",
-                                        DataType::List(Box::new(Field::new(
-                                            "struct",
-                                            DataType::Struct(vec![]),
-                                            false,
-                                        ))),
-                                        false,
-                                    ),
-                                ]),
-                                false,
-                            ))),
-                            false,
-                        ),
-                    ]),
-                    false,
-                ),
-                Field::new(
-                    "union<int64, list[union<date32, list[union<>]>]>",
-                    DataType::Union(
                         vec![
-                            Field::new("int64", DataType::Int64, true),
-                            Field::new(
-                                "list[union<date32, list[union<>]>]",
-                                DataType::List(Box::new(Field::new(
-                                    "union<date32, list[union<>]>",
-                                    DataType::Union(
-                                        vec![
-                                            Field::new("date32", DataType::Date32, true),
-                                            Field::new(
-                                                "list[union<>]",
-                                                DataType::List(Box::new(Field::new(
-                                                    "union",
-                                                    DataType::Union(
-                                                        vec![],
-                                                        vec![],
-                                                        UnionMode::Sparse,
-                                                    ),
-                                                    false,
-                                                ))),
-                                                false,
-                                            ),
-                                        ],
-                                        vec![0, 1],
-                                        UnionMode::Dense,
-                                    ),
-                                    false,
-                                ))),
-                                false,
-                            ),
+                            Field::new("float32", UInt8, false),
+                            Field::new("int32", Int32, true),
+                            Field::new("bool", Boolean, true),
                         ],
-                        vec![0, 1],
-                        UnionMode::Sparse,
+                        true,
                     ),
                     false,
                 ),
-                Field::new("struct<>", DataType::Struct(vec![]), true),
+                Field::new_struct(
+                    "struct<dictionary<int32, utf8>>",
+                    vec![Field::new(
+                        "dictionary<int32, utf8>",
+                        Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                        false,
+                    )],
+                    false,
+                ),
+                Field::new_struct(
+                    "struct<int64, list[struct<date32, list[struct<>]>]>",
+                    vec![
+                        Field::new("int64", DataType::Int64, true),
+                        Field::new_list(
+                            "list[struct<date32, list[struct<>]>]",
+                            Field::new_struct(
+                                "struct",
+                                vec![
+                                    Field::new("date32", DataType::Date32, true),
+                                    Field::new_list(
+                                        "list[struct<>]",
+                                        Field::new(
+                                            "struct",
+                                            DataType::Struct(Fields::empty()),
+                                            false,
+                                        ),
+                                        false,
+                                    ),
+                                ],
+                                false,
+                            ),
+                            false,
+                        ),
+                    ],
+                    false,
+                ),
+                Field::new_union(
+                    "union<int64, list[union<date32, list[union<>]>]>",
+                    vec![0, 1],
+                    vec![
+                        Field::new("int64", DataType::Int64, true),
+                        Field::new_list(
+                            "list[union<date32, list[union<>]>]",
+                            Field::new_union(
+                                "union<date32, list[union<>]>",
+                                vec![0, 1],
+                                vec![
+                                    Field::new("date32", DataType::Date32, true),
+                                    Field::new_list(
+                                        "list[union<>]",
+                                        Field::new(
+                                            "union",
+                                            DataType::Union(
+                                                UnionFields::empty(),
+                                                UnionMode::Sparse,
+                                            ),
+                                            false,
+                                        ),
+                                        false,
+                                    ),
+                                ],
+                                UnionMode::Dense,
+                            ),
+                            false,
+                        ),
+                    ],
+                    UnionMode::Sparse,
+                ),
+                Field::new("struct<>", DataType::Struct(Fields::empty()), true),
                 Field::new(
                     "union<>",
-                    DataType::Union(vec![], vec![], UnionMode::Dense),
+                    DataType::Union(UnionFields::empty(), UnionMode::Dense),
                     true,
                 ),
                 Field::new(
                     "union<>",
-                    DataType::Union(vec![], vec![], UnionMode::Sparse),
+                    DataType::Union(UnionFields::empty(), UnionMode::Sparse),
                     true,
                 ),
                 Field::new(
                     "union<int32, utf8>",
                     DataType::Union(
-                        vec![
-                            Field::new("int32", DataType::Int32, true),
-                            Field::new("utf8", DataType::Utf8, true),
-                        ],
-                        vec![2, 3], // non-default type ids
+                        UnionFields::new(
+                            vec![2, 3], // non-default type ids
+                            vec![
+                                Field::new("int32", DataType::Int32, true),
+                                Field::new("utf8", DataType::Utf8, true),
+                            ],
+                        ),
                         UnionMode::Dense,
                     ),
                     true,
                 ),
+                #[allow(deprecated)]
                 Field::new_dict(
                     "dictionary<int32, utf8>",
-                    DataType::Dictionary(
-                        Box::new(DataType::Int32),
-                        Box::new(DataType::Utf8),
-                    ),
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
                     true,
                     123,
                     true,
                 ),
+                #[allow(deprecated)]
                 Field::new_dict(
                     "dictionary<uint8, uint32>",
-                    DataType::Dictionary(
-                        Box::new(DataType::UInt8),
-                        Box::new(DataType::UInt32),
-                    ),
+                    DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::UInt32)),
                     true,
                     123,
                     true,
@@ -1025,7 +1161,10 @@ mod tests {
             md,
         );
 
-        let fb = schema_to_fb(&schema);
+        let mut dictionary_tracker = DictionaryTracker::new(true);
+        let fb = IpcSchemaEncoder::new()
+            .with_dictionary_tracker(&mut dictionary_tracker)
+            .schema_to_fb(&schema);
 
         // read back fields
         let ipc = crate::root_as_schema(fb.finished_data()).unwrap();
@@ -1035,32 +1174,48 @@ mod tests {
 
     #[test]
     fn schema_from_bytes() {
-        // bytes of a schema generated from python (0.14.0), saved as an `crate::Message`.
-        // the schema is: Field("field1", DataType::UInt32, false)
+        // Bytes of a schema generated via following python code, using pyarrow 10.0.1:
+        //
+        // import pyarrow as pa
+        // schema = pa.schema([pa.field('field1', pa.uint32(), nullable=False)])
+        // sink = pa.BufferOutputStream()
+        // with pa.ipc.new_stream(sink, schema) as writer:
+        //     pass
+        // # stripping continuation & length prefix & suffix bytes to get only schema bytes
+        // [x for x in sink.getvalue().to_pybytes()][8:-8]
         let bytes: Vec<u8> = vec![
-            16, 0, 0, 0, 0, 0, 10, 0, 12, 0, 6, 0, 5, 0, 8, 0, 10, 0, 0, 0, 0, 1, 3, 0,
-            12, 0, 0, 0, 8, 0, 8, 0, 0, 0, 4, 0, 8, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 20,
-            0, 0, 0, 16, 0, 20, 0, 8, 0, 0, 0, 7, 0, 12, 0, 0, 0, 16, 0, 16, 0, 0, 0, 0,
-            0, 0, 2, 32, 0, 0, 0, 20, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 8, 0,
-            4, 0, 6, 0, 0, 0, 32, 0, 0, 0, 6, 0, 0, 0, 102, 105, 101, 108, 100, 49, 0, 0,
-            0, 0, 0, 0,
+            16, 0, 0, 0, 0, 0, 10, 0, 12, 0, 6, 0, 5, 0, 8, 0, 10, 0, 0, 0, 0, 1, 4, 0, 12, 0, 0,
+            0, 8, 0, 8, 0, 0, 0, 4, 0, 8, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 20, 0, 0, 0, 16, 0, 20,
+            0, 8, 0, 0, 0, 7, 0, 12, 0, 0, 0, 16, 0, 16, 0, 0, 0, 0, 0, 0, 2, 16, 0, 0, 0, 32, 0,
+            0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 102, 105, 101, 108, 100, 49, 0, 0, 0, 0, 6,
+            0, 8, 0, 4, 0, 6, 0, 0, 0, 32, 0, 0, 0,
         ];
-        let ipc = crate::root_as_message(&bytes[..]).unwrap();
+        let ipc = crate::root_as_message(&bytes).unwrap();
         let schema = ipc.header_as_schema().unwrap();
 
-        // a message generated from Rust, same as the Python one
-        let bytes: Vec<u8> = vec![
-            16, 0, 0, 0, 0, 0, 10, 0, 14, 0, 12, 0, 11, 0, 4, 0, 10, 0, 0, 0, 20, 0, 0,
-            0, 0, 0, 0, 1, 3, 0, 10, 0, 12, 0, 0, 0, 8, 0, 4, 0, 10, 0, 0, 0, 8, 0, 0, 0,
-            8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16, 0, 0, 0, 12, 0, 18, 0, 12, 0, 0, 0,
-            11, 0, 4, 0, 12, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 2, 20, 0, 0, 0, 0, 0, 6, 0,
-            8, 0, 4, 0, 6, 0, 0, 0, 32, 0, 0, 0, 6, 0, 0, 0, 102, 105, 101, 108, 100, 49,
-            0, 0,
-        ];
-        let ipc2 = crate::root_as_message(&bytes[..]).unwrap();
-        let schema2 = ipc.header_as_schema().unwrap();
+        // generate same message with Rust
+        let data_gen = crate::writer::IpcDataGenerator::default();
+        let mut dictionary_tracker = DictionaryTracker::new(true);
+        let arrow_schema = Schema::new(vec![Field::new("field1", DataType::UInt32, false)]);
+        let bytes = data_gen
+            .schema_to_bytes_with_dictionary_tracker(
+                &arrow_schema,
+                &mut dictionary_tracker,
+                &crate::writer::IpcWriteOptions::default(),
+            )
+            .ipc_message;
 
-        assert_eq!(schema, schema2);
+        let ipc2 = crate::root_as_message(&bytes).unwrap();
+        let schema2 = ipc2.header_as_schema().unwrap();
+
+        // can't compare schema directly as it compares the underlying bytes, which can differ
+        assert!(schema.custom_metadata().is_none());
+        assert!(schema2.custom_metadata().is_none());
+        assert_eq!(schema.endianness(), schema2.endianness());
+        assert!(schema.features().is_none());
+        assert!(schema2.features().is_none());
+        assert_eq!(fb_to_schema(schema), fb_to_schema(schema2));
+
         assert_eq!(ipc.version(), ipc2.version());
         assert_eq!(ipc.header_type(), ipc2.header_type());
         assert_eq!(ipc.bodyLength(), ipc2.bodyLength());

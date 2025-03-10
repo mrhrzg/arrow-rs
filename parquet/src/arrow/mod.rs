@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Provides API for reading/writing Arrow
-//! [RecordBatch](arrow::record_batch::RecordBatch)es and
-//! [Array](arrow::array::Array)s to/from Parquet Files.
+//! High-level API for reading/writing Arrow
+//! [RecordBatch](arrow_array::RecordBatch)es and
+//! [Array](arrow_array::Array)s to/from Parquet Files.
 //!
 //! [Apache Arrow](http://arrow.apache.org/) is a cross-language development platform for
 //! in-memory data.
@@ -25,12 +25,13 @@
 //!# Example of writing Arrow record batch to Parquet file
 //!
 //!```rust
-//! use arrow::array::{Int32Array, ArrayRef};
-//! use arrow::record_batch::RecordBatch;
-//! use parquet::arrow::arrow_writer::ArrowWriter;
-//! use parquet::file::properties::WriterProperties;
-//! use std::fs::File;
-//! use std::sync::Arc;
+//! # use arrow_array::{Int32Array, ArrayRef};
+//! # use arrow_array::RecordBatch;
+//! # use parquet::arrow::arrow_writer::ArrowWriter;
+//! # use parquet::file::properties::WriterProperties;
+//! # use tempfile::tempfile;
+//! # use std::sync::Arc;
+//! # use parquet::basic::Compression;
 //! let ids = Int32Array::from(vec![1, 2, 3, 4]);
 //! let vals = Int32Array::from(vec![5, 6, 7, 8]);
 //! let batch = RecordBatch::try_from_iter(vec![
@@ -38,10 +39,12 @@
 //!   ("val", Arc::new(vals) as ArrayRef),
 //! ]).unwrap();
 //!
-//! let file = File::create("data.parquet").unwrap();
+//! let file = tempfile().unwrap();
 //!
-//! // Default writer properties
-//! let props = WriterProperties::builder().build();
+//! // WriterProperties can be used to set Parquet file options
+//! let props = WriterProperties::builder()
+//!     .set_compression(Compression::SNAPPY)
+//!     .build();
 //!
 //! let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
 //!
@@ -51,28 +54,15 @@
 //! writer.close().unwrap();
 //! ```
 //!
-//! `WriterProperties` can be used to set Parquet file options
-//! ```rust
-//! use parquet::file::properties::WriterProperties;
-//! use parquet::basic::{ Compression, Encoding };
-//! use parquet::file::properties::WriterVersion;
-//!
-//! // File compression
-//! let props = WriterProperties::builder()
-//!     .set_compression(Compression::SNAPPY)
-//!     .build();
-//! ```
-//!
 //! # Example of reading parquet file into arrow record batch
 //!
 //! ```rust
-//! use std::fs::File;
-//! use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-//!
+//! # use std::fs::File;
+//! # use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 //! # use std::sync::Arc;
-//! # use arrow::array::Int32Array;
+//! # use arrow_array::Int32Array;
 //! # use arrow::datatypes::{DataType, Field, Schema};
-//! # use arrow::record_batch::RecordBatch;
+//! # use arrow_array::RecordBatch;
 //! # use parquet::arrow::arrow_writer::ArrowWriter;
 //! #
 //! # let ids = Int32Array::from(vec![1, 2, 3, 4]);
@@ -91,7 +81,7 @@
 //! #     writer.write(&batch).expect("Writing batch");
 //! # }
 //! # writer.close().unwrap();
-//!
+//! #
 //! let file = File::open("data.parquet").unwrap();
 //!
 //! let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
@@ -112,23 +102,40 @@ mod decoder;
 
 #[cfg(feature = "async")]
 pub mod async_reader;
+#[cfg(feature = "async")]
+pub mod async_writer;
 
 mod record_reader;
 experimental!(mod schema);
 
-#[allow(deprecated)]
-pub use self::arrow_reader::{ArrowReader, ParquetFileArrowReader};
+use std::sync::Arc;
+
 pub use self::arrow_writer::ArrowWriter;
 #[cfg(feature = "async")]
 pub use self::async_reader::ParquetRecordBatchStreamBuilder;
-use crate::schema::types::SchemaDescriptor;
+#[cfg(feature = "async")]
+pub use self::async_writer::AsyncArrowWriter;
+use crate::schema::types::{SchemaDescriptor, Type};
+use arrow_schema::{FieldRef, Schema};
+
+// continue to export deprecated methods until they are removed
+#[allow(deprecated)]
+pub use self::schema::arrow_to_parquet_schema;
 
 pub use self::schema::{
-    arrow_to_parquet_schema, parquet_to_arrow_schema, parquet_to_arrow_schema_by_columns,
+    add_encoded_arrow_schema_to_metadata, encode_arrow_schema, parquet_to_arrow_field_levels,
+    parquet_to_arrow_schema, parquet_to_arrow_schema_by_columns, ArrowSchemaConverter, FieldLevels,
 };
 
 /// Schema metadata key used to store serialized Arrow IPC schema
 pub const ARROW_SCHEMA_META_KEY: &str = "ARROW:schema";
+
+/// The value of this metadata key, if present on [`Field::metadata`], will be used
+/// to populate [`BasicTypeInfo::id`]
+///
+/// [`Field::metadata`]: arrow_schema::Field::metadata
+/// [`BasicTypeInfo::id`]: crate::schema::types::BasicTypeInfo::id
+pub const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
 
 /// A [`ProjectionMask`] identifies a set of columns within a potentially nested schema to project
 ///
@@ -155,7 +162,7 @@ pub const ARROW_SCHEMA_META_KEY: &str = "ARROW:schema";
 /// For non-nested schemas, i.e. those containing only primitive columns, the root
 /// and leaves are the same
 ///
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionMask {
     /// If present a leaf column should be included if the value at
     /// the corresponding index is true
@@ -175,10 +182,7 @@ impl ProjectionMask {
     /// Note: repeated or out of order indices will not impact the final mask
     ///
     /// i.e. `[0, 1, 2]` will construct the same mask as `[1, 0, 0, 2]`
-    pub fn leaves(
-        schema: &SchemaDescriptor,
-        indices: impl IntoIterator<Item = usize>,
-    ) -> Self {
+    pub fn leaves(schema: &SchemaDescriptor, indices: impl IntoIterator<Item = usize>) -> Self {
         let mut mask = vec![false; schema.num_columns()];
         for leaf_idx in indices {
             mask[leaf_idx] = true;
@@ -191,10 +195,7 @@ impl ProjectionMask {
     /// Note: repeated or out of order indices will not impact the final mask
     ///
     /// i.e. `[0, 1, 2]` will construct the same mask as `[1, 0, 0, 2]`
-    pub fn roots(
-        schema: &SchemaDescriptor,
-        indices: impl IntoIterator<Item = usize>,
-    ) -> Self {
+    pub fn roots(schema: &SchemaDescriptor, indices: impl IntoIterator<Item = usize>) -> Self {
         let num_root_columns = schema.root_schema().get_fields().len();
         let mut root_mask = vec![false; num_root_columns];
         for root_idx in indices {
@@ -211,8 +212,444 @@ impl ProjectionMask {
         Self { mask: Some(mask) }
     }
 
+    // Given a starting point in the schema, do a DFS for that node adding leaf paths to `paths`.
+    fn find_leaves(root: &Arc<Type>, parent: Option<&String>, paths: &mut Vec<String>) {
+        let path = parent
+            .map(|p| [p, root.name()].join("."))
+            .unwrap_or(root.name().to_string());
+        if root.is_group() {
+            for child in root.get_fields() {
+                Self::find_leaves(child, Some(&path), paths);
+            }
+        } else {
+            // Reached a leaf, add to paths
+            paths.push(path);
+        }
+    }
+
+    /// Create a [`ProjectionMask`] which selects only the named columns
+    ///
+    /// All leaf columns that fall below a given name will be selected. For example, given
+    /// the schema
+    /// ```ignore
+    /// message schema {
+    ///   OPTIONAL group a (MAP) {
+    ///     REPEATED group key_value {
+    ///       REQUIRED BYTE_ARRAY key (UTF8);  // leaf index 0
+    ///       OPTIONAL group value (MAP) {
+    ///         REPEATED group key_value {
+    ///           REQUIRED INT32 key;          // leaf index 1
+    ///           REQUIRED BOOLEAN value;      // leaf index 2
+    ///         }
+    ///       }
+    ///     }
+    ///   }
+    ///   REQUIRED INT32 b;                    // leaf index 3
+    ///   REQUIRED DOUBLE c;                   // leaf index 4
+    /// }
+    /// ```
+    /// `["a.key_value.value", "c"]` would return leaf columns 1, 2, and 4. `["a"]` would return
+    /// columns 0, 1, and 2.
+    ///
+    /// Note: repeated or out of order indices will not impact the final mask.
+    ///
+    /// i.e. `["b", "c"]` will construct the same mask as `["c", "b", "c"]`.
+    pub fn columns<'a>(
+        schema: &SchemaDescriptor,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        // first make vector of paths for leaf columns
+        let mut paths: Vec<String> = vec![];
+        for root in schema.root_schema().get_fields() {
+            Self::find_leaves(root, None, &mut paths);
+        }
+        assert_eq!(paths.len(), schema.num_columns());
+
+        let mut mask = vec![false; schema.num_columns()];
+        for name in names {
+            for idx in 0..schema.num_columns() {
+                if paths[idx].starts_with(name) {
+                    mask[idx] = true;
+                }
+            }
+        }
+
+        Self { mask: Some(mask) }
+    }
+
     /// Returns true if the leaf column `leaf_idx` is included by the mask
     pub fn leaf_included(&self, leaf_idx: usize) -> bool {
         self.mask.as_ref().map(|m| m[leaf_idx]).unwrap_or(true)
+    }
+
+    /// Union two projection masks
+    ///
+    /// Example:
+    /// ```text
+    /// mask1 = [true, false, true]
+    /// mask2 = [false, true, true]
+    /// union(mask1, mask2) = [true, true, true]
+    /// ```
+    pub fn union(&mut self, other: &Self) {
+        match (self.mask.as_ref(), other.mask.as_ref()) {
+            (None, _) | (_, None) => self.mask = None,
+            (Some(a), Some(b)) => {
+                debug_assert_eq!(a.len(), b.len());
+                let mask = a.iter().zip(b.iter()).map(|(&a, &b)| a || b).collect();
+                self.mask = Some(mask);
+            }
+        }
+    }
+
+    /// Intersect two projection masks
+    ///
+    /// Example:
+    /// ```text
+    /// mask1 = [true, false, true]
+    /// mask2 = [false, true, true]
+    /// intersect(mask1, mask2) = [false, false, true]
+    /// ```
+    pub fn intersect(&mut self, other: &Self) {
+        match (self.mask.as_ref(), other.mask.as_ref()) {
+            (None, _) => self.mask = other.mask.clone(),
+            (_, None) => {}
+            (Some(a), Some(b)) => {
+                debug_assert_eq!(a.len(), b.len());
+                let mask = a.iter().zip(b.iter()).map(|(&a, &b)| a && b).collect();
+                self.mask = Some(mask);
+            }
+        }
+    }
+}
+
+/// Lookups up the parquet column by name
+///
+/// Returns the parquet column index and the corresponding arrow field
+pub fn parquet_column<'a>(
+    parquet_schema: &SchemaDescriptor,
+    arrow_schema: &'a Schema,
+    name: &str,
+) -> Option<(usize, &'a FieldRef)> {
+    let (root_idx, field) = arrow_schema.fields.find(name)?;
+    if field.data_type().is_nested() {
+        // Nested fields are not supported and require non-trivial logic
+        // to correctly walk the parquet schema accounting for the
+        // logical type rules - <https://github.com/apache/parquet-format/blob/master/LogicalTypes.md>
+        //
+        // For example a ListArray could correspond to anything from 1 to 3 levels
+        // in the parquet schema
+        return None;
+    }
+
+    // This could be made more efficient (#TBD)
+    let parquet_idx = (0..parquet_schema.columns().len())
+        .find(|x| parquet_schema.get_column_root_idx(*x) == root_idx)?;
+    Some((parquet_idx, field))
+}
+
+#[cfg(test)]
+mod test {
+    use crate::arrow::ArrowWriter;
+    use crate::file::metadata::{ParquetMetaData, ParquetMetaDataReader, ParquetMetaDataWriter};
+    use crate::file::properties::{EnabledStatistics, WriterProperties};
+    use crate::schema::parser::parse_message_type;
+    use crate::schema::types::SchemaDescriptor;
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    use super::ProjectionMask;
+
+    #[test]
+    // Reproducer for https://github.com/apache/arrow-rs/issues/6464
+    fn test_metadata_read_write_partial_offset() {
+        let parquet_bytes = create_parquet_file();
+
+        // read the metadata from the file WITHOUT the page index structures
+        let original_metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&parquet_bytes)
+            .unwrap();
+
+        // this should error because the page indexes are not present, but have offsets specified
+        let metadata_bytes = metadata_to_bytes(&original_metadata);
+        let err = ParquetMetaDataReader::new()
+            .with_page_indexes(true) // there are no page indexes in the metadata
+            .parse_and_finish(&metadata_bytes)
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "EOF: Parquet file too small. Page index range 82..115 overlaps with file metadata 0..341"
+        );
+    }
+
+    #[test]
+    fn test_metadata_read_write_roundtrip() {
+        let parquet_bytes = create_parquet_file();
+
+        // read the metadata from the file
+        let original_metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&parquet_bytes)
+            .unwrap();
+
+        // read metadata back from the serialized bytes and ensure it is the same
+        let metadata_bytes = metadata_to_bytes(&original_metadata);
+        assert_ne!(
+            metadata_bytes.len(),
+            parquet_bytes.len(),
+            "metadata is subset of parquet"
+        );
+
+        let roundtrip_metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&metadata_bytes)
+            .unwrap();
+
+        assert_eq!(original_metadata, roundtrip_metadata);
+    }
+
+    #[test]
+    fn test_metadata_read_write_roundtrip_page_index() {
+        let parquet_bytes = create_parquet_file();
+
+        // read the metadata from the file including the page index structures
+        // (which are stored elsewhere in the footer)
+        let original_metadata = ParquetMetaDataReader::new()
+            .with_page_indexes(true)
+            .parse_and_finish(&parquet_bytes)
+            .unwrap();
+
+        // read metadata back from the serialized bytes and ensure it is the same
+        let metadata_bytes = metadata_to_bytes(&original_metadata);
+        let roundtrip_metadata = ParquetMetaDataReader::new()
+            .with_page_indexes(true)
+            .parse_and_finish(&metadata_bytes)
+            .unwrap();
+
+        // Need to normalize the metadata first to remove offsets in data
+        let original_metadata = normalize_locations(original_metadata);
+        let roundtrip_metadata = normalize_locations(roundtrip_metadata);
+        assert_eq!(
+            format!("{original_metadata:#?}"),
+            format!("{roundtrip_metadata:#?}")
+        );
+        assert_eq!(original_metadata, roundtrip_metadata);
+    }
+
+    /// Sets the page index offset locations in the metadata to `None`
+    ///
+    /// This is because the offsets are used to find the relative location of the index
+    /// structures, and thus differ depending on how the structures are stored.
+    fn normalize_locations(metadata: ParquetMetaData) -> ParquetMetaData {
+        let mut metadata_builder = metadata.into_builder();
+        for rg in metadata_builder.take_row_groups() {
+            let mut rg_builder = rg.into_builder();
+            for col in rg_builder.take_columns() {
+                rg_builder = rg_builder.add_column_metadata(
+                    col.into_builder()
+                        .set_offset_index_offset(None)
+                        .set_index_page_offset(None)
+                        .set_column_index_offset(None)
+                        .build()
+                        .unwrap(),
+                );
+            }
+            let rg = rg_builder.build().unwrap();
+            metadata_builder = metadata_builder.add_row_group(rg);
+        }
+        metadata_builder.build()
+    }
+
+    /// Write a parquet filed into an in memory buffer
+    fn create_parquet_file() -> Bytes {
+        let mut buf = vec![];
+        let data = vec![100, 200, 201, 300, 102, 33];
+        let array: ArrayRef = Arc::new(Int32Array::from(data));
+        let batch = RecordBatch::try_from_iter(vec![("id", array)]).unwrap();
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+
+        Bytes::from(buf)
+    }
+
+    /// Serializes `ParquetMetaData` into a memory buffer, using `ParquetMetadataWriter
+    fn metadata_to_bytes(metadata: &ParquetMetaData) -> Bytes {
+        let mut buf = vec![];
+        ParquetMetaDataWriter::new(&mut buf, metadata)
+            .finish()
+            .unwrap();
+        Bytes::from(buf)
+    }
+
+    #[test]
+    fn test_mask_from_column_names() {
+        let message_type = "
+            message test_schema {
+                OPTIONAL group a (MAP) {
+                    REPEATED group key_value {
+                        REQUIRED BYTE_ARRAY key (UTF8);
+                        OPTIONAL group value (MAP) {
+                            REPEATED group key_value {
+                                REQUIRED INT32 key;
+                                REQUIRED BOOLEAN value;
+                            }
+                        }
+                    }
+                }
+                REQUIRED INT32 b;
+                REQUIRED DOUBLE c;
+            }
+            ";
+        let parquet_group_type = parse_message_type(message_type).unwrap();
+        let schema = SchemaDescriptor::new(Arc::new(parquet_group_type));
+
+        let mask = ProjectionMask::columns(&schema, ["foo", "bar"]);
+        assert_eq!(mask.mask.unwrap(), vec![false; 5]);
+
+        let mask = ProjectionMask::columns(&schema, []);
+        assert_eq!(mask.mask.unwrap(), vec![false; 5]);
+
+        let mask = ProjectionMask::columns(&schema, ["a", "c"]);
+        assert_eq!(mask.mask.unwrap(), [true, true, true, false, true]);
+
+        let mask = ProjectionMask::columns(&schema, ["a.key_value.key", "c"]);
+        assert_eq!(mask.mask.unwrap(), [true, false, false, false, true]);
+
+        let mask = ProjectionMask::columns(&schema, ["a.key_value.value", "b"]);
+        assert_eq!(mask.mask.unwrap(), [false, true, true, true, false]);
+
+        let message_type = "
+            message test_schema {
+                OPTIONAL group a (LIST) {
+                    REPEATED group list {
+                        OPTIONAL group element (LIST) {
+                            REPEATED group list {
+                                OPTIONAL group element (LIST) {
+                                    REPEATED group list {
+                                        OPTIONAL BYTE_ARRAY element (UTF8);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                REQUIRED INT32 b;
+            }
+            ";
+        let parquet_group_type = parse_message_type(message_type).unwrap();
+        let schema = SchemaDescriptor::new(Arc::new(parquet_group_type));
+
+        let mask = ProjectionMask::columns(&schema, ["a", "b"]);
+        assert_eq!(mask.mask.unwrap(), [true, true]);
+
+        let mask = ProjectionMask::columns(&schema, ["a.list.element", "b"]);
+        assert_eq!(mask.mask.unwrap(), [true, true]);
+
+        let mask =
+            ProjectionMask::columns(&schema, ["a.list.element.list.element.list.element", "b"]);
+        assert_eq!(mask.mask.unwrap(), [true, true]);
+
+        let mask = ProjectionMask::columns(&schema, ["b"]);
+        assert_eq!(mask.mask.unwrap(), [false, true]);
+
+        let message_type = "
+            message test_schema {
+                OPTIONAL INT32 a;
+                OPTIONAL INT32 b;
+                OPTIONAL INT32 c;
+                OPTIONAL INT32 d;
+                OPTIONAL INT32 e;
+            }
+            ";
+        let parquet_group_type = parse_message_type(message_type).unwrap();
+        let schema = SchemaDescriptor::new(Arc::new(parquet_group_type));
+
+        let mask = ProjectionMask::columns(&schema, ["a", "b"]);
+        assert_eq!(mask.mask.unwrap(), [true, true, false, false, false]);
+
+        let mask = ProjectionMask::columns(&schema, ["d", "b", "d"]);
+        assert_eq!(mask.mask.unwrap(), [false, true, false, true, false]);
+
+        let message_type = "
+            message test_schema {
+                OPTIONAL INT32 a;
+                OPTIONAL INT32 b;
+                OPTIONAL INT32 a;
+                OPTIONAL INT32 d;
+                OPTIONAL INT32 e;
+            }
+            ";
+        let parquet_group_type = parse_message_type(message_type).unwrap();
+        let schema = SchemaDescriptor::new(Arc::new(parquet_group_type));
+
+        let mask = ProjectionMask::columns(&schema, ["a", "e"]);
+        assert_eq!(mask.mask.unwrap(), [true, false, true, false, true]);
+    }
+
+    #[test]
+    fn test_projection_mask_union() {
+        let mut mask1 = ProjectionMask {
+            mask: Some(vec![true, false, true]),
+        };
+        let mask2 = ProjectionMask {
+            mask: Some(vec![false, true, true]),
+        };
+        mask1.union(&mask2);
+        assert_eq!(mask1.mask, Some(vec![true, true, true]));
+
+        let mut mask1 = ProjectionMask { mask: None };
+        let mask2 = ProjectionMask {
+            mask: Some(vec![false, true, true]),
+        };
+        mask1.union(&mask2);
+        assert_eq!(mask1.mask, None);
+
+        let mut mask1 = ProjectionMask {
+            mask: Some(vec![true, false, true]),
+        };
+        let mask2 = ProjectionMask { mask: None };
+        mask1.union(&mask2);
+        assert_eq!(mask1.mask, None);
+
+        let mut mask1 = ProjectionMask { mask: None };
+        let mask2 = ProjectionMask { mask: None };
+        mask1.union(&mask2);
+        assert_eq!(mask1.mask, None);
+    }
+
+    #[test]
+    fn test_projection_mask_intersect() {
+        let mut mask1 = ProjectionMask {
+            mask: Some(vec![true, false, true]),
+        };
+        let mask2 = ProjectionMask {
+            mask: Some(vec![false, true, true]),
+        };
+        mask1.intersect(&mask2);
+        assert_eq!(mask1.mask, Some(vec![false, false, true]));
+
+        let mut mask1 = ProjectionMask { mask: None };
+        let mask2 = ProjectionMask {
+            mask: Some(vec![false, true, true]),
+        };
+        mask1.intersect(&mask2);
+        assert_eq!(mask1.mask, Some(vec![false, true, true]));
+
+        let mut mask1 = ProjectionMask {
+            mask: Some(vec![true, false, true]),
+        };
+        let mask2 = ProjectionMask { mask: None };
+        mask1.intersect(&mask2);
+        assert_eq!(mask1.mask, Some(vec![true, false, true]));
+
+        let mut mask1 = ProjectionMask { mask: None };
+        let mask2 = ProjectionMask { mask: None };
+        mask1.intersect(&mask2);
+        assert_eq!(mask1.mask, None);
     }
 }

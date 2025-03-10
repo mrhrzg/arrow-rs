@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Utility functions for working with Arrow data
 pub use arrow_buffer::{bit_chunk_iterator, bit_util};
 
 pub use arrow_data::bit_iterator;
@@ -25,10 +26,9 @@ pub mod bench_util;
 #[cfg(feature = "test_utils")]
 pub mod data_gen;
 #[cfg(feature = "prettyprint")]
-pub mod pretty;
+pub use arrow_cast::pretty;
 pub mod string_writer;
 #[cfg(any(test, feature = "test_utils"))]
 pub mod test_util;
 
 pub use arrow_cast::display;
-pub(crate) mod reader_parser;

@@ -25,12 +25,12 @@
 # arrow-rs/.github_changelog_generator
 #
 # Usage:
-# CHANGELOG_GITHUB_TOKEN=<TOKEN> ./update_change_log.sh
+# ARROW_GITHUB_API_TOKEN=<TOKEN> ./update_change_log.sh
 
 set -e
 
-SINCE_TAG="25.0.0"
-FUTURE_RELEASE="26.0.0"
+SINCE_TAG="54.2.0"
+FUTURE_RELEASE="54.2.1"
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_TOP_DIR="$(cd "${SOURCE_DIR}/../../" && pwd)"
@@ -79,7 +79,7 @@ docker run -it --rm -e CHANGELOG_GITHUB_TOKEN="$ARROW_GITHUB_API_TOKEN" -v "$(pw
     --cache-log=.githubchangeloggenerator.cache.log \
     --http-cache \
     --max-issues=300 \
-    --exclude-tags-regex "^object_store_\d+\.\d+\.\d+$" \
+    --exclude-tags-regex "^object_store_\d+\.\d+\.\d+$|-rc\d$" \
     --since-tag ${SINCE_TAG} \
     --future-release ${FUTURE_RELEASE}
 
